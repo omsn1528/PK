@@ -75,6 +75,7 @@ def main() -> int:
                 ("speech models for other languages: Arabic, downloads, the second machine", ["tests/test_speech.py"]),
                 ("post text: write again with AI, edit, post without re-making", ["tests/test_post_text.py"]),
                 ("Hindi and Hinglish trending metadata and emoji rules", ["tests/test_hindi_metadata.py"]),
+                ("download resilience on network and SSL drops", ["tests/test_ssl_recovery.py"]),
                 ("live recording stops and empty stream URLs", ["tests/test_live.py"])]
         for name, args in runs:
             print(f"\n=== {name} ===", flush=True)

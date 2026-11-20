@@ -104,9 +104,49 @@ def cookie_opts() -> dict:
 def _ydl(opts):
     import yt_dlp
     # a channel or playlist link is answered as "a list" straight away, never walked video by video
-    return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
-                             "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
-                             "concurrent_fragment_downloads": 4, **cookie_opts(), **opts})
+    base = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _Quiet(),
+        "extract_flat": "in_playlist",
+        "playlistend": 1,
+        "socket_timeout": 30,
+        "retries": 25,
+        "fragment_retries": 25,
+        "file_access_retries": 10,
+        "retry_sleep": 2,
+        "continuedl": True,
+        "buffersize": 1024 * 64,
+        "http_chunk_size": 10485760,
+        "concurrent_fragment_downloads": 2,
+    }
+    return yt_dlp.YoutubeDL({**base, **cookie_opts(), **opts})
+
+
+def _download_resilient(url: str, opts: dict, max_tries=3):
+    """Download with automatic resumption and retry if a transient SSL or network drop occurs."""
+    last_exc = None
+    for attempt in range(max_tries):
+        cur_opts = dict(opts)
+        if attempt > 0:
+            # Fall back to single-threaded sequential download to eliminate TLS socket race conditions on Windows
+            cur_opts["concurrent_fragment_downloads"] = 1
+            cur_opts["socket_timeout"] = 45
+            time.sleep(2 * attempt)
+        try:
+            with _youtube_guard(url), _ydl(cur_opts) as ydl:
+                ydl.download([url])
+            return
+        except YouTubeBlocked:
+            raise
+        except Exception as e:
+            last_exc = e
+            err_msg = str(e)
+            if "sign in to confirm" in err_msg.lower() or "bot" in err_msg.lower():
+                raise
+    if last_exc:
+        raise last_exc
 
 
 def _video_format(height):
@@ -258,17 +298,15 @@ def download_audio(url: str, job_dir: Path, on_progress=None) -> Path:
         if on_progress and d.get("status") == "downloading" and total:
             on_progress(d.get("downloaded_bytes", 0) / total)
 
-    with _youtube_guard(url), _ydl({"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(job_dir / "audio_src.%(ext)s"),
-               "progress_hooks": [hook]}) as ydl:
-        ydl.download([url])
+    _download_resilient(url, {"format": "ba[ext=m4a]/ba/worst", "outtmpl": str(job_dir / "audio_src.%(ext)s"),
+                              "progress_hooks": [hook]})
     return _biggest(job_dir, "audio_src")
 
 
 def download(url: str, job_dir: Path, height=720) -> Path:
     """The whole video. Used for shorter videos, where this is quicker than fetching pieces."""
-    with _youtube_guard(url), _ydl({"format": _video_format(height), "merge_output_format": "mp4",
-                                    "outtmpl": str(job_dir / "source.%(ext)s")}) as ydl:
-        ydl.download([url])
+    _download_resilient(url, {"format": _video_format(height), "merge_output_format": "mp4",
+                              "outtmpl": str(job_dir / "source.%(ext)s")})
     return _biggest(job_dir, "source")
 
 
@@ -281,8 +319,7 @@ def download_section(url: str, out_dir: Path, stem: str, start: float, end: floa
             "download_ranges": download_range_func(None, [(max(0.0, start), end)])}
     if exact:
         opts["force_keyframes_at_cuts"] = True
-    with _youtube_guard(url), _ydl(opts) as ydl:
-        ydl.download([url])
+    _download_resilient(url, opts)
     return _biggest(out_dir, stem)
 
 
