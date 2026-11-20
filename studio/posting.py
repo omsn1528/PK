@@ -22,6 +22,16 @@ def _mine() -> list:
 OPEN = ("scheduled", "posting")
 
 
+def list_mine() -> list:
+    """All posts for the signed-in user, safe fields only (no internal keys), newest first."""
+    safe_keys = {"id", "status", "title", "account_name", "platform", "due_at", "posted_at",
+                 "views", "url", "error", "creator", "progress", "tries", "visibility", "priority", "paused"}
+    # Scheduled posts sorted by due_at (ascending = queue order); posted/failed by posted_at desc
+    scheduled = sorted((p for p in _mine() if p["status"] in OPEN), key=lambda p: p.get("priority", p["due_at"]))
+    done      = sorted((p for p in _mine() if p["status"] not in OPEN), key=lambda p: -(p.get("posted_at") or p.get("due_at") or 0))
+    return [{k: v for k, v in p.items() if k in safe_keys} for p in scheduled + done]
+
+
 def _save():
     with _lock:
         tmp = _FILE.with_suffix(".tmp")
@@ -48,7 +58,7 @@ def _mirror(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
-        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "error")}
+        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "error", "visibility", "paused", "priority")}
         jobs.save(job)
 
 
@@ -64,7 +74,7 @@ def _next_slot(account_id, gap_min, cap):
     return t
 
 
-def enqueue(job, clip, account_ids, now=False) -> list:
+def enqueue(job, clip, account_ids, now=False, visibility="public") -> list:
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -78,8 +88,9 @@ def enqueue(job, clip, account_ids, now=False) -> list:
             due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
             p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
-                 "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
-                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None}
+                 "due_at": due, "priority": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
+                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None,
+                 "visibility": visibility, "paused": False}
             _posts.append(p)
             made.append(p)
         _save()
@@ -91,11 +102,28 @@ def enqueue(job, clip, account_ids, now=False) -> list:
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     c = creators.get(job["creator"])
+    # Auto-upload from job options (the new per-job toggle)
+    if job.get("options", {}).get("auto_upload"):
+        # Get all connected accounts for this user
+        try:
+            with ctx.as_user(job["user"]):
+                accs = accounts.list_accounts()
+                account_ids = [a["id"] for a in accs if a.get("platform") in ("youtube", "instagram", "tiktok")]
+        except Exception:  # noqa: BLE001
+            account_ids = []
+        if account_ids:
+            vis = (job.get("options") or {}).get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
+            made = enqueue(job, clip, account_ids, now=False, visibility=vis)
+            if made:
+                creator_id = job.get("creator") or "none"
+                creators.log(creator_id, f"Auto-upload: queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
+            return  # don't double-post via creator autopost
+    # Legacy creator-level autopost setting
     if not c or not c["autopost"] or not c["accounts"]:
         return
     if clip.get("score", 0) < c["post_min_score"]:
         return  # includes hand-made clips (score 0): those wait for you to press Post
-    made = enqueue(job, clip, c["accounts"])
+    made = enqueue(job, clip, c["accounts"], visibility=c.get("privacy", "public"))
     if made:
         creators.log(c["id"], f"Queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
 
@@ -117,12 +145,14 @@ def _post(p):
         path = Path(job["dir"]) / "clips" / clip["file"]
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
         title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
+        # Per-post visibility overrides creator default
+        vis = p.get("visibility") or creator["privacy"]
         if acc["platform"] == "youtube":
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), creator["privacy"])
+            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), vis)
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
         elif acc["platform"] == "tiktok":
-            rid, url = accounts.tiktok_upload(acc, path, f"{title}\n\n{cap}", creator["privacy"])
+            rid, url = accounts.tiktok_upload(acc, path, f"{title}\n\n{cap}", vis)
         else:
             raise RuntimeError("That kind of account is no longer supported.")
         p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
@@ -143,14 +173,19 @@ def _post(p):
 def _run():
     while True:
         time.sleep(15)
-        due = [p for p in list(_posts) if p["status"] == "scheduled" and p["due_at"] <= time.time() and p.get("user")]
+        # Sort by priority so manually reordered items go first
+        due = sorted(
+            [p for p in list(_posts) if p["status"] == "scheduled" and p["due_at"] <= time.time()
+             and p.get("user") and not p.get("paused")],
+            key=lambda p: p.get("priority", p["due_at"])
+        )
         for p in due:
             try:
                 with ctx.as_user(p["user"]):
                     if accounts.settings()["paused"]:
                         continue
                     with _lock:
-                        if p["status"] != "scheduled":
+                        if p["status"] != "scheduled" or p.get("paused"):
                             continue
                         p["status"] = "posting"
                     _post(p)
@@ -189,9 +224,43 @@ def _stats():
 def cancel(pid):
     with _lock:
         p = next((p for p in _mine() if p["id"] == pid), None)
-        if not p or p["status"] != "scheduled":
+        if not p or p["status"] not in ("scheduled", "posting"):
             raise ValueError("Only posts that are still waiting can be cancelled.")
         p["status"] = "cancelled"
+        p["paused"] = False
+        _save()
+    _mirror(p)
+
+
+def stop(pid):
+    """Stop/cancel a post whether scheduled, queued, or actively posting."""
+    cancel(pid)
+
+
+def pause(pid):
+    """Pause a queued post so it stays in place without uploading."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        p["paused"] = True
+        if p["status"] == "posting":
+            p["status"] = "scheduled"
+        _save()
+    _mirror(p)
+
+
+def resume(pid):
+    """Resume a paused, cancelled or failed post back into the active queue."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        p["paused"] = False
+        if p["status"] in ("cancelled", "failed"):
+            p["status"] = "scheduled"
+            p["tries"] = 0
+            p["error"] = None
         _save()
     _mirror(p)
 
@@ -201,9 +270,94 @@ def retry(pid):
         p = next((p for p in _mine() if p["id"] == pid), None)
         if not p or p["status"] not in ("failed", "cancelled"):
             raise ValueError("Only failed or cancelled posts can be retried.")
-        p.update(status="scheduled", due_at=time.time(), tries=0, error=None)
+        p.update(status="scheduled", due_at=time.time(), tries=0, error=None, paused=False)
         _save()
     _mirror(p)
+
+
+def expedite(pid):
+    """Move a scheduled post to post immediately (Post Now)."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        p["due_at"] = time.time()
+        p["paused"] = False
+        p["priority"] = time.time() - 3600  # highest priority
+        if p["status"] in ("failed", "cancelled"):
+            p["status"] = "scheduled"
+            p["tries"] = 0
+            p["error"] = None
+        _save()
+    _mirror(p)
+
+
+def expedite_all():
+    """Move all scheduled posts for the current user to post immediately."""
+    with _lock:
+        now = time.time()
+        for i, p in enumerate(_mine()):
+            if p["status"] == "scheduled":
+                p["due_at"] = now
+                p["paused"] = False
+                p["priority"] = now + i
+        _save()
+
+
+def update(pid, data: dict) -> dict:
+    """Update visibility (public/private/unlisted), custom schedule (due_at), or title."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        if "visibility" in data and data["visibility"] in ("public", "private", "unlisted"):
+            p["visibility"] = data["visibility"]
+        if "due_at" in data:
+            p["due_at"] = float(data["due_at"])
+            if "priority" not in data:
+                p["priority"] = p["due_at"]
+        if "priority" in data:
+            p["priority"] = float(data["priority"])
+        if "title" in data and str(data["title"]).strip():
+            p["title"] = str(data["title"]).strip()
+        if "paused" in data:
+            p["paused"] = bool(data["paused"])
+        _save()
+    _mirror(p)
+    return p
+
+
+def move(pid, direction: str):
+    """Move a post up or down in queue priority sequence."""
+    with _lock:
+        scheduled = sorted([p for p in _mine() if p["status"] in OPEN], key=lambda p: p.get("priority", p["due_at"]))
+        idx = next((i for i, p in enumerate(scheduled) if p["id"] == pid), None)
+        if idx is None:
+            raise ValueError("Post is not currently in the queue.")
+        if direction == "up" and idx > 0:
+            scheduled[idx], scheduled[idx - 1] = scheduled[idx - 1], scheduled[idx]
+        elif direction == "down" and idx < len(scheduled) - 1:
+            scheduled[idx], scheduled[idx + 1] = scheduled[idx + 1], scheduled[idx]
+        base_time = time.time()
+        for i, p in enumerate(scheduled):
+            p["priority"] = base_time + i * 10
+        _save()
+    for p in scheduled:
+        _mirror(p)
+
+
+def reorder(pids: list):
+    """Explicitly set the queue sequence order from a list of post IDs."""
+    with _lock:
+        mine = {p["id"]: p for p in _mine() if p["status"] in OPEN}
+        base_time = time.time()
+        for idx, pid in enumerate(pids):
+            if pid in mine:
+                mine[pid]["priority"] = base_time + idx * 10
+        _save()
+    for pid in pids:
+        if pid in mine:
+            _mirror(mine[pid])
 
 
 def overview() -> dict:

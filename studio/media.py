@@ -17,10 +17,11 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # YouTube sometimes refuses a server's downloads altogether ("sign in to confirm you're not a bot"). It is a
 # refusal of the server, not of one video, so once it happens YouTube links are turned away at once for a few
 # minutes, with a clear message, instead of each one waiting to fail. Then the next link simply tries again.
-YT_PAUSE = 600
+YT_PAUSE = 10
 _yt_refused_until = 0.0
-YT_BLOCKED = ("YouTube isn't letting PeakCut download videos right now. Upload the video file instead, or use a "
-              "Twitch or Kick link. YouTube links will be tried again in a few minutes.")
+YT_BLOCKED = ("YouTube is requesting bot verification for this IP right now. "
+              "To fix: export YouTube cookies from your browser to C:\\peakcut\\cookies.txt, "
+              "or upload the video file directly (Upload video button).")
 _BOT_CHECK = re.compile(r"not a bot|confirm you.?re not|sign in to confirm(?! your age)", re.I)
 
 
@@ -95,13 +96,68 @@ class _Quiet:
     def error(self, m): pass
 
 
+def _cookie_opts() -> dict:
+    """Try to load cookies to avoid YouTube bot detection.
+    Checks C:\\peakcut\\cookies.txt or data\\cookies.txt first, then browser cookies."""
+    from . import config
+    from pathlib import Path
+    # 1. Automatic cookie file detection in root or data
+    for cand in (config.ROOT / "cookies.txt", config.DATA_DIR / "cookies.txt",
+                 config.ROOT / "youtube_cookies.txt", config.DATA_DIR / "youtube_cookies.txt"):
+        if cand.is_file() and cand.stat().st_size > 50:
+            return {"cookiefile": str(cand)}
+
+    # 2. Allow overriding via env: PEAKCUT_YT_COOKIES=firefox / chrome / edge / /path/to/cookies.txt
+    override = config.env("PEAKCUT_YT_COOKIES", "").strip()
+    if override:
+        if override.endswith(".txt") or "/" in override or "\\" in override:
+            if Path(override).is_file():
+                return {"cookiefile": override}
+        elif override in ("chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari"):
+            return {"cookiesfrombrowser": (override,)}
+
+    # 3. Auto-detect: try browsers in order of likelihood on Windows
+    for browser in ("chrome", "edge", "firefox"):
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": _Quiet(),
+                                   "cookiesfrombrowser": (browser,), "skip_download": True}) as ydl:
+                _ = ydl.cookiejar
+                return {"cookiesfrombrowser": (browser,)}
+        except Exception:  # noqa: BLE001
+            continue
+    return {}
+
+
+_cookie_opts_cache: dict | None = None
+_cookie_opts_at: float = 0.0
+
+
+def _get_cookie_opts() -> dict:
+    """Cached cookie options, refreshed every 5 minutes."""
+    global _cookie_opts_cache, _cookie_opts_at
+    if _cookie_opts_cache is None or time.time() - _cookie_opts_at > 300:
+        _cookie_opts_cache = _cookie_opts()
+        _cookie_opts_at = time.time()
+    return _cookie_opts_cache
+
+
 def _ydl(opts):
     import yt_dlp
     # a channel or playlist link is answered as "a list" straight away, never walked video by video
-    return yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
-                             "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
-                             "concurrent_fragment_downloads": 4, **opts})
+    base = {"noplaylist": True, "quiet": True, "no_warnings": True, "logger": _Quiet(),
+            "extract_flat": "in_playlist", "playlistend": 1, "socket_timeout": 20,
+            "concurrent_fragment_downloads": 4,
+            # PO token / visitor data workaround: try web, android, ios, mweb clients
+            "extractor_args": {"youtube": {"player_client": ["web", "android", "ios", "mweb"]}},
+            **_get_cookie_opts()}
+    return yt_dlp.YoutubeDL({**base, **opts})
 
+
+def clear_youtube_block():
+    """Force-clear the YouTube block pause (called from the UI retry button)."""
+    global _yt_refused_until
+    _yt_refused_until = 0.0
 
 def _video_format(height):
     return f"bv*[height<={height}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={height}]+ba/b[height<={height}]/b"

@@ -22,9 +22,20 @@ from . import config, ctx
 _lock = threading.RLock()
 _states: dict = {}   # one-time values for the connect redirects: state -> (user id, when, platform)
 
+VIDEO_DEFAULTS = {
+    "quality": 720,
+    "layout": "blur",
+    "style": "bounce",
+    "captions": True,
+    "max_clips": 6,
+    "min_len": 15,
+    "max_len": 60,
+}
+
 SECRET_KEYS = ("discord_webhook", "telegram_token")
 SETTING_DEFAULTS = {"discord_webhook": "", "telegram_token": "", "telegram_chat": "", "paused": False,
-                    "digest_hour": 8, "last_digest": "", "tour_done": False}
+                    "digest_hour": 8, "last_digest": "", "tour_done": False,
+                    "video_defaults": dict(VIDEO_DEFAULTS)}
 
 YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
 IG = "https://graph.instagram.com"
@@ -244,13 +255,52 @@ def settings() -> dict:
     return dict(_settings_mem[u])
 
 
+def clean_video_defaults(opts: dict) -> dict:
+    """Validate video defaults, substituting safe fallbacks for missing/unsupported values."""
+    from . import render
+    cur = dict(VIDEO_DEFAULTS)
+    if not isinstance(opts, dict):
+        return cur
+    q = opts.get("quality")
+    if q in (720, 1080, "720", "1080"):
+        cur["quality"] = int(q)
+    layout = str(opts.get("layout") or "").lower()
+    if layout in render.LAYOUTS:
+        cur["layout"] = layout
+    style = str(opts.get("style") or "").lower()
+    if style in render.STYLES:
+        cur["style"] = style
+    if "captions" in opts:
+        cur["captions"] = bool(opts["captions"])
+    if "max_clips" in opts:
+        try:
+            cur["max_clips"] = max(1, min(20, int(opts["max_clips"])))
+        except (ValueError, TypeError):
+            pass
+    if "min_len" in opts:
+        try:
+            cur["min_len"] = max(5, min(120, int(opts["min_len"])))
+        except (ValueError, TypeError):
+            pass
+    if "max_len" in opts:
+        try:
+            cur["max_len"] = max(10, min(180, int(opts["max_len"])))
+        except (ValueError, TypeError):
+            pass
+    return cur
+
+
 def save_settings(patch: dict) -> dict:
     with _lock:
         s = settings()
         for k, v in patch.items():
             if k not in SETTING_DEFAULTS:
                 continue
-            if k in ("paused", "tour_done"):
+            if k == "video_defaults":
+                existing = s.get("video_defaults", dict(VIDEO_DEFAULTS))
+                merged = {**existing, **(v if isinstance(v, dict) else {})}
+                s[k] = clean_video_defaults(merged)
+            elif k in ("paused", "tour_done"):
                 v = bool(v)
             elif k == "digest_hour":
                 v = max(0, min(23, int(v)))

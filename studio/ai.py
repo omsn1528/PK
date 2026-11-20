@@ -23,7 +23,7 @@ from . import config
 
 # name -> (label shown on the pages, address, how it is spoken to, where to get a key, an example model id)
 PROVIDERS = {
-    "gemini": ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini", "https://aistudio.google.com/apikey", "gemini-2.5-flash"),
+    "gemini": ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini", "https://aistudio.google.com/apikey", "gemini-flash-lite-latest"),
     "openai": ("OpenAI", "https://api.openai.com/v1", "openai", "https://platform.openai.com/api-keys", "gpt-4o-mini"),
     "xai": ("Grok", "https://api.x.ai/v1", "openai", "https://console.x.ai", "grok-4"),
     "groq": ("Groq", "https://api.groq.com/openai/v1", "openai", "https://console.groq.com/keys", "llama-3.3-70b-versatile"),
@@ -34,6 +34,9 @@ PROVIDERS = {
 }
 ALIASES = {"google": "gemini", "grok": "xai", "claude": "anthropic", "local": "ollama"}
 NO_KEY = {"ollama", "custom"}       # a model running on your own machine needs no key
+# Google keeps old model ids in the list after new keys can no longer use them. Hiding them here stops the
+# settings page from offering a model that would only answer with "no longer available to new users".
+RETIRED_GEMINI = {"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-2.5-pro-preview"}
 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
@@ -67,7 +70,8 @@ def current() -> dict:
     return {"provider": ALIASES.get(p, p),
             "models": list(d["models"]) if d.get("provider") else list(config.AI_MODELS),
             "base_url": (str(d.get("base_url") or "") if d.get("provider") else config.AI_BASE_URL).rstrip("/"),
-            "key": str(d["key"]) if d.get("provider") and "key" in d else config.ai_key()}
+            "key": str(d["key"]) if d.get("provider") and "key" in d else config.ai_key(),
+            "extra_keys": list(d.get("extra_keys") or [])}
 
 
 def provider() -> str:
@@ -100,16 +104,20 @@ def public() -> dict:
     """What the settings page may see. The key itself never leaves the server: only whether there is one, and
     its last four characters so the owner can tell which key it is."""
     c = current()
+    extra = c.get("extra_keys") or []
     return {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(c["key"]),
             "key_hint": c["key"][-4:] if len(c["key"]) >= 12 else "", "ready": ready(), "label": label(),
             "saved_here": bool(_from_dashboard().get("provider")),
+            "extra_key_count": len(extra),
+            "extra_key_hints": [k[-4:] if len(k) >= 12 else "" for k in extra],
             "providers": [{"id": k, "label": v[0], "address": v[1], "needs_key": k not in NO_KEY, "key_url": v[3], "example": v[4]}
                           for k, v in PROVIDERS.items()]}
 
 
-def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
+def save(provider_id: str, model_ids, address: str = "", new_key=None, extra_keys=None) -> dict:
     """Save the choice made in the dashboard. `new_key` None keeps the key that is already there (the page never
-    has it to send back); an empty string removes it."""
+    has it to send back); an empty string removes it. `extra_keys` is a list of backup API keys that are tried
+    automatically when the primary key hits a rate limit or quota error."""
     p = ALIASES.get(str(provider_id or "").strip().lower(), str(provider_id or "").strip().lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
@@ -129,10 +137,16 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
     k = old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:400]
     if not k and p not in NO_KEY:
         raise ValueError("Paste the key for this service.")
+    # Extra keys: a list of backup keys to rotate through on rate limit / quota errors.
+    # We keep the old ones if the caller passes None (page didn't touch the field).
+    if extra_keys is None:
+        ek = old.get("extra_keys") or [] if old["provider"] == p else []
+    else:
+        ek = [str(x).strip()[:400] for x in (extra_keys or []) if str(x).strip()][:5]
     with _lock:
         f = _file()
         tmp = f.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"provider": p, "models": ms, "base_url": address, "key": k}), encoding="utf-8")
+        tmp.write_text(json.dumps({"provider": p, "models": ms, "base_url": address, "key": k, "extra_keys": ek}), encoding="utf-8")
         try:
             os.chmod(tmp, 0o600)        # the key is only for whoever runs the server
         except OSError:
@@ -152,7 +166,34 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     base = str(address or "").strip().rstrip("/") or (c["base_url"] if c["provider"] == p else "") or PROVIDERS[p][1]
     if not base:
         raise ValueError("Enter the service's address first.")
+
+    # Providers that need a key before they can list models
+    if p not in NO_KEY and p != "openrouter" and not k:
+        raise ValueError(f"Paste your {PROVIDERS[p][0]} API key first to discover available models.")
+
     how = PROVIDERS[p][2]
+    if p == "ollama":
+        # Handle Ollama local models via /v1/models or native /api/tags
+        found = []
+        try:
+            r = httpx.get(f"{base}/models", timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                found = [m.get("id", "") for m in data.get("data", []) if isinstance(m, dict)]
+        except Exception:
+            pass
+        if not found:
+            raw_base = re.sub(r"/v1/?$", "", base)
+            try:
+                r_native = httpx.get(f"{raw_base}/api/tags", timeout=8)
+                if r_native.status_code == 200:
+                    found = [m.get("name", "") for m in r_native.json().get("models", []) if isinstance(m, dict)]
+            except Exception as e:
+                raise ValueError(f"Could not connect to Ollama at {base}. Ensure Ollama is running ('ollama serve').") from e
+        if not found:
+            raise ValueError("Ollama is running, but no models are installed yet. Run 'ollama pull llama3.2' in terminal, then click Refresh.")
+        return sorted({m for m in found if m})[:400]
+
     if how == "gemini":
         r = httpx.get(base, params={"pageSize": 200}, headers={"x-goog-api-key": k}, timeout=20)
     elif how == "anthropic":
@@ -164,7 +205,8 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     data = r.json()
     if how == "gemini":
         found = [m.get("name", "").split("/")[-1] for m in data.get("models", [])
-                 if "generateContent" in (m.get("supportedGenerationMethods") or [])]
+                 if "generateContent" in (m.get("supportedGenerationMethods") or [])
+                 and m.get("name", "").split("/")[-1] not in RETIRED_GEMINI]
     else:
         found = [m.get("id", "") for m in data.get("data", []) if isinstance(m, dict)]
     return sorted({m for m in found if m})[:400]
@@ -179,6 +221,14 @@ def test() -> dict:
     return {"ok": True, "model": ms[0], "tokens": sent + wrote, "answer": str(out)[:80]}
 
 
+def all_keys() -> list:
+    """Primary key plus any extra backup keys, deduplicated. Used for automatic rotation on quota/rate errors."""
+    c = current()
+    primary = c["key"]
+    extras = [k for k in (c.get("extra_keys") or []) if k and k != primary]
+    return [k for k in [primary] + extras if k]
+
+
 class AIError(RuntimeError):
     pass
 
@@ -190,6 +240,11 @@ def explain(e) -> str:
     """What went wrong with an AI call, in words the owner can act on."""
     text, low = str(e), str(e).lower()
     name = (models() or ["?"])[0]
+    if "no longer available" in low or "deprecated" in low:
+        suggestion = re.search(r"use (?:models/)?([\w.\-]+)", text, re.I)
+        hint = f' Use "{suggestion.group(1)}" instead.' if suggestion else \
+               " Pick a newer model from the list under Settings, AI."
+        return f'{label()} has retired the model "{name}".{hint}'
     if "404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low:
         return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
     if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:

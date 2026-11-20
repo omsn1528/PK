@@ -36,7 +36,7 @@ check("normal login still works", anon.post("/api/auth/login", json={"email": "z
 
 # ---- the page's cheap check
 s1 = c.get("/api/sync").json()
-check("first sync sends everything", sorted(s1), ["accounts", "ai", "creators", "jobs", "unread", "v"])
+check("first sync sends everything", sorted(s1), ["accounts", "ai", "creators", "jobs", "preferences", "unread", "v"])
 s2 = c.get("/api/sync", params={"v": s1["v"]}).json()
 check("second sync says nothing changed", s2, {"v": s1["v"]})
 c.post("/api/creators", json={"name": "Sync Test"}, headers=ORIGIN)

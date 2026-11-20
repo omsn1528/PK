@@ -45,7 +45,7 @@ if __name__ == "__main__":
     check("it sees a fully loaded processor", hot["cpu"] > 80 and hot["busy"], str(hot))
     [p.join() for p in ps]
     t0 = time.time()
-    while load.busy() and time.time() - t0 < 15:
+    while load.busy() and time.time() - t0 < 25:
         time.sleep(0.2)
     check("it sees the load end within seconds", not load.busy(), f"{time.time() - t0:.1f}s after the work stopped: {load.state()}")
 

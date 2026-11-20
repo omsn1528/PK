@@ -22,6 +22,7 @@ def main() -> int:
     data = Path(tempfile.mkdtemp(prefix="peakcut-test-"))
     env = {**os.environ, "PEAKCUT_DATA": str(data), "PEAKCUT_PORT": str(PORT), "PEAKCUT_PUBLIC_URL": BASE,
            "PEAKCUT_HOST": "127.0.0.1", "PEAKCUT_AUTO_RELOAD": "0", "DATABASE_URL": "",
+           "PEAKCUT_MODELS": str(ROOT / "data" / "models"),
            "PEAKCUT_ACCOUNTS": "1", "PEAKCUT_FETCH_MODEL": "0", "PEAKCUT_UPDATE_CHECK": "0",                   # these tests are about people signing in; tests/test_local.py covers the default
            # nothing outside this machine is contacted: no AI, no email, no Google sign-in
            "PEAKCUT_SMTP_HOST": "", "PEAKCUT_VERIFY_EMAIL": "1",   # the tests cover the confirm-your-email rule
@@ -65,7 +66,9 @@ def main() -> int:
                 ("fresh installs: ffmpeg, the speech model, AI errors", ["tests/test_tools.py"]),
                 ("the storage folder: full drive, open, move", ["tests/test_storage.py"]),
                 ("security: visitor address, email addresses, Google sign-in, prompts", ["tests/test_hardening.py"]),
-                ("long logs, the machine monitor, failed recordings, admin day totals", ["tests/test_robustness.py"])]
+                ("long logs, the machine monitor, failed recordings, admin day totals", ["tests/test_robustness.py"]),
+                ("subtitle accuracy, phonetic correction and timestamp synchronization", ["tests/test_subtitles.py"]),
+                ("persistent preferences, stage retry and network disconnection recovery", ["tests/test_recovery.py"])]
         for name, args in runs:
             print(f"\n=== {name} ===", flush=True)
             r = subprocess.run([sys.executable, *args], cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")

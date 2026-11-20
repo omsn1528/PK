@@ -242,6 +242,16 @@ class Session:
         finally:
             self.ended = True
 
+    def resume(self):
+        """Resume recording after a network disconnection or pause."""
+        self.stop_flag.clear()
+        self.ended = False
+        self.job["status"] = "live"
+        self.job["stage"] = "Reconnecting to stream"
+        self.job["error"] = None
+        jobs.save(self.job)
+        ctx.bump()
+
     def _ingest_loop(self):
         fails = 0
         url = self.job["source"]["url"]
@@ -250,6 +260,14 @@ class Session:
                 info = resolve(url)
             except NotLive as e:
                 fails += 1
+                from . import jobs as _j
+                if _j.is_network_error(e) and self.samples > 0:
+                    self.job["status"] = "paused"
+                    self.job["stage"] = "Paused – Internet connection lost"
+                    self.job["can_resume"] = True
+                    _j.save(self.job)
+                    self.stop_flag.wait(15)
+                    continue
                 if self.samples == 0 or fails >= 3:
                     if self.samples == 0:
                         self.job["error"] = f"Could not start recording: {e}"
@@ -774,6 +792,111 @@ def recover(job):
         creators.log(job["creator"], f"Finished {len(todo)} clip(s) from a recording interrupted by a restart")
 
     jobs.submit_live(cleanup)
+
+
+def detect(url: str) -> dict:
+    """Detect whether a link is a live stream, upcoming, ended, or unavailable, and get metadata."""
+    import yt_dlp
+    url = normalize((url or "").strip())
+    if not media.site_allowed(url):
+        raise ValueError("Links must be from YouTube, Twitch or Kick.")
+    if media.is_youtube(url) and media.youtube_paused():
+        raise NotLive(media.YT_BLOCKED)
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "logger": _Quiet()}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            i = ydl.extract_info(url, download=False)
+    except Exception as e:
+        if media.note_refusal(url, e):
+            raise NotLive(media.YT_BLOCKED) from e
+        err = str(e)
+        if "Private video" in err:
+            return {"url": url, "status": "unavailable", "is_live": False, "message": "This video/stream is private."}
+        if "not available" in err.lower() or "unavailable" in err.lower():
+            return {"url": url, "status": "unavailable", "is_live": False, "message": "Stream or recording is currently unavailable."}
+        raise ValueError(f"Could not inspect stream: {err[-150:]}")
+
+    if not i:
+        return {"url": url, "status": "unavailable", "is_live": False, "message": "No stream metadata found."}
+
+    live_status = i.get("live_status") or ("is_live" if i.get("is_live") else None)
+    is_live = bool(i.get("is_live")) or (live_status == "is_live")
+    title = i.get("title") or ""
+    uploader = i.get("uploader") or i.get("channel") or ""
+    thumb = i.get("thumbnail") or ""
+    duration = float(i.get("duration") or 0)
+    viewers = i.get("concurrent_view_count") or i.get("view_count")
+
+    if is_live:
+        status = "live"
+        message = "Stream is broadcasting LIVE. Ready to capture!"
+    elif live_status == "is_upcoming":
+        status = "upcoming"
+        message = "Stream is scheduled and has not started yet."
+    elif live_status == "was_live":
+        status = "ended"
+        message = "Stream has concluded (available as full VOD)."
+    elif duration > 0:
+        status = "vod"
+        message = "Recorded video (VOD)."
+    else:
+        status = "offline"
+        message = "Stream or channel is currently offline."
+
+    game_name, game_tags = games.detect(title, uploader)
+
+    return {
+        "url": url,
+        "status": status,
+        "is_live": is_live,
+        "live_status": live_status or "none",
+        "title": title,
+        "uploader": uploader,
+        "thumbnail": thumb,
+        "duration": duration,
+        "viewers": viewers,
+        "game": game_name,
+        "message": message
+    }
+
+
+def start_capture(url: str, options: dict = None, creator_id: str = None) -> dict:
+    """Start capturing an accessible live stream directly (standalone or for a creator)."""
+    url = normalize((url or "").strip())
+    if not re.match(r"^https?://[^/]+\.[^/]+/", url + "/"):
+        raise ValueError("Enter a valid livestream link.")
+    if not media.site_allowed(url):
+        raise ValueError("Channel links must be from YouTube, Twitch or Kick.")
+    if media.is_youtube(url) and media.youtube_paused():
+        raise ValueError(media.YT_BLOCKED.replace("download videos", "record YouTube streams")
+                         .replace("Upload the video file instead, or use a Twitch or Kick link. YouTube links",
+                                  "Twitch and Kick streams still work. YouTube"))
+    for s in active_mine():
+        if s.job.get("source", {}).get("url") == url:
+            raise ValueError("This stream is already being recorded.")
+    if len(active_mine()) >= config.MAX_LIVE_PER_USER:
+        raise ValueError(f"You're already recording {len(active_mine())} streams, the most this server allows at once. Stop one first.")
+    if len(active()) >= config.MAX_LIVE_TOTAL or (active() and load.busy()):
+        raise ValueError("PeakCut is recording as many streams as it can right now. Try again in a little while.")
+    from . import tools
+    if tools.missing():
+        raise ValueError(tools.HELP)
+
+    info = resolve(url)
+    title = info.get("title") or "Live stream"
+    uploader = info.get("uploader") or ""
+
+    c = creators.get(creator_id) if creator_id else None
+    settings = dict(c) if c else dict(creators.DEFAULTS)
+    if options:
+        settings.update({k: v for k, v in options.items() if k in settings})
+
+    job = jobs.create({"type": "live", "url": url, "name": title}, options or {}, enqueue=False,
+                      creator=c["id"] if c else None, kind="live")
+    job.update(status="live", stage="Connecting to the stream", title=title, uploader=uploader)
+    jobs.save(job)
+    Session(job, settings).start()
+    return job
 
 
 def start_session(creator: dict, url=None) -> dict:

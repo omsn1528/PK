@@ -672,7 +672,8 @@ def sync(v: str = ""):
         return _sync_unchanged(v) or {"v": token}
     from . import notices
     return {"v": token, "jobs": [jobs.public(j) for j in jobs.list_jobs()], "creators": _creator_rows(),
-            "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread()}
+            "accounts": accounts.list_accounts(), "ai": usage.brief(), "unread": notices.unread(),
+            "preferences": accounts.settings().get("video_defaults", accounts.VIDEO_DEFAULTS)}
 
 
 @app.get("/api/jobs")
@@ -704,6 +705,13 @@ def link_preview(request: Request, url: str = ""):
         raise
     except Exception:
         raise HTTPException(422, "Couldn't open that video. Check the link is public and complete.")
+
+
+@app.post("/api/youtube/unblock")
+def youtube_unblock():
+    """Clear the YouTube block timer so the next link is tried immediately."""
+    media.clear_youtube_block()
+    return {"ok": True, "paused": media.youtube_paused()}
 
 
 @app.post("/api/jobs")
@@ -943,9 +951,64 @@ def rerender(jid: str, cid: str, body: dict = Body(...)):
     return jobs.public(job)
 
 
+@app.get("/api/jobs/{jid}/clips/{cid}/subtitles")
+def get_clip_subtitles(jid: str, cid: str):
+    _job_or_404(jid)
+    try:
+        return jobs.get_clip_subtitles(jid, cid)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.put("/api/jobs/{jid}/clips/{cid}/subtitles")
+def update_clip_subtitles(jid: str, cid: str, body: dict = Body(...)):
+    job = _job_or_404(jid)
+    clip = next((c for c in job["clips"] if c["id"] == cid), None)
+    if not clip:
+        raise HTTPException(404, "No such clip")
+    text = str(body.get("text") or "").strip()
+    try:
+        jobs.request_render(jid, cid, {"subtitles_text": text})
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    return jobs.public(job)
+
+
+@app.post("/api/jobs/{jid}/retry")
+@app.post("/api/jobs/{jid}/resume")
+def retry_job(jid: str, body: dict = Body(default={})):
+    _job_or_404(jid)
+    stage = str(body.get("stage") or "auto")
+    try:
+        return jobs.retry_job(jid, stage=stage)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/jobs/{jid}/pause")
+def pause_job_route(jid: str):
+    """Pause a running or queued job. The job can be resumed later."""
+    _job_or_404(jid)
+    try:
+        return jobs.pause_job(jid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/jobs/{jid}/stop")
+def stop_job_route(jid: str):
+    """Stop a job and keep any clips already made. It can be resumed later."""
+    _job_or_404(jid)
+    try:
+        return jobs.stop_job(jid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
     job = _job_or_404(jid)
+    # Stopped jobs can be deleted; only actively running/queued ones cannot.
     if job["status"] in ("queued", "running", "live") or jid in live.SESSIONS:
         raise HTTPException(409, "This is still being worked on. Stop it or wait for it to finish first.")
     jobs.delete(jid)
@@ -1219,6 +1282,46 @@ def go_live(cid: str, body: dict = Body(default={})):
         raise HTTPException(400, str(e))
 
 
+@app.get("/api/live/detect")
+def live_detect(request: Request, url: str = ""):
+    url = url.strip()[:500]
+    if not url:
+        raise HTTPException(400, "Enter a livestream URL.")
+    if not media.site_allowed(url):
+        raise HTTPException(400, "Paste a full link to a YouTube, Twitch or Kick stream.")
+    _throttle("livedetect:" + ctx.uid(), 20, 60)
+    try:
+        return live.detect(url)
+    except live.NotLive as e:
+        return {"url": url, "status": "offline", "is_live": False, "message": str(e)}
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"Could not inspect stream: {str(e)[:150]}")
+
+
+@app.post("/api/live/capture")
+def live_capture(request: Request, body: dict = Body(...)):
+    _need_verified()
+    _quota()
+    _throttle("livecapture:" + ctx.uid(), 10, 600)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "Enter a livestream URL.")
+    options = body.get("options") or {}
+    creator_id = body.get("creator") or None
+    try:
+        job = live.start_capture(url, options=options, creator_id=creator_id)
+        ctx.bump()
+        return jobs.public(job)
+    except live.NotLive as e:
+        raise HTTPException(400, f"Cannot capture: {e}")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Could not start capture: {str(e)[:150]}")
+
+
 @app.post("/api/live/{jid}/stop")
 def stop_live(jid: str):
     s = live.mine(jid)
@@ -1226,6 +1329,22 @@ def stop_live(jid: str):
         raise HTTPException(404, "This recording has already ended")
     s.stop()
     return {"ok": True}
+
+
+@app.post("/api/live/{jid}/resume")
+def resume_live(jid: str):
+    s = live.mine(jid)
+    if s:
+        s.resume()
+        return {"ok": True}
+    job = _job_or_404(jid)
+    if job.get("kind") == "live" and job.get("status") in ("paused", "error"):
+        try:
+            resumed = live.start_capture(job["source"]["url"], options=job.get("options", {}), creator_id=job.get("creator"))
+            return jobs.public(resumed)
+        except Exception as e:
+            raise HTTPException(400, f"Could not resume stream: {e}")
+    raise HTTPException(404, "This recording has ended.")
 
 
 @app.post("/api/live/{jid}/clip")
@@ -1265,9 +1384,11 @@ def ai_get(request: Request):
 def ai_put(request: Request, body: dict = Body(...)):
     _admin(request)
     k = body.get("key")
+    extra_keys = body.get("extra_keys")   # list of backup keys, or None to leave unchanged
     try:
         out = ai.save(body.get("provider"), body.get("models"), body.get("base_url") or "",
-                      None if k is None or (isinstance(k, str) and not k.strip() and not body.get("remove_key")) else str(k))
+                      None if k is None or (isinstance(k, str) and not k.strip() and not body.get("remove_key")) else str(k),
+                      extra_keys=extra_keys)
     except (ValueError, TypeError) as e:
         raise HTTPException(400, str(e))
     usage.forget_all()
@@ -1319,6 +1440,24 @@ def put_settings(body: dict = Body(...)):
     except (ValueError, TypeError) as e:
         raise HTTPException(400, str(e))
     return accounts.public_settings()
+
+
+@app.get("/api/settings/preferences")
+def get_preferences():
+    return {"video_defaults": accounts.settings().get("video_defaults", accounts.VIDEO_DEFAULTS)}
+
+
+@app.put("/api/settings/preferences")
+def put_preferences(body: dict = Body(...)):
+    opts = body.get("video_defaults", body)
+    saved = accounts.save_settings({"video_defaults": opts})
+    return {"ok": True, "video_defaults": saved.get("video_defaults", accounts.VIDEO_DEFAULTS)}
+
+
+@app.post("/api/settings/preferences/reset")
+def reset_preferences():
+    saved = accounts.save_settings({"video_defaults": dict(accounts.VIDEO_DEFAULTS)})
+    return {"ok": True, "video_defaults": saved.get("video_defaults", accounts.VIDEO_DEFAULTS)}
 
 
 @app.get("/api/accounts")
@@ -1449,13 +1588,23 @@ def apps_put(request: Request, body: dict = Body(...)):
         raise HTTPException(400, str(e))
 
 
+@app.get("/api/posts")
+def list_posts():
+    """All upload history and queue for the signed-in user."""
+    return posting.list_mine()
+
+
 @app.post("/api/posts")
 def add_posts(body: dict = Body(...)):
     job = jobs.get(str(body.get("job")))
     clip = next((c for c in job["clips"] if c["id"] == body.get("clip")), None) if job else None
     if not clip or clip.get("status") != "done":
         raise HTTPException(404, "That clip is not ready")
-    made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20], now=bool(body.get("now")))
+    vis = str(body.get("visibility") or "public").lower()
+    if vis not in ("public", "private", "unlisted"):
+        vis = "public"
+    made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20],
+                           now=bool(body.get("now")), visibility=vis)
     if not made:
         raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
     return {"queued": len(made)}
@@ -1463,12 +1612,57 @@ def add_posts(body: dict = Body(...)):
 
 @app.post("/api/posts/{pid}/{action}")
 def post_action(pid: str, action: str):
+    actions = {
+        "cancel": posting.cancel,
+        "retry": posting.retry,
+        "now": posting.expedite,
+        "pause": posting.pause,
+        "resume": posting.resume,
+        "stop": posting.stop,
+    }
+    fn = actions.get(action)
+    if not fn:
+        raise HTTPException(404, f"Unknown action: {action}")
     try:
-        {"cancel": posting.cancel, "retry": posting.retry}[action](pid)
-    except KeyError:
-        raise HTTPException(404)
+        fn(pid)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.patch("/api/posts/{pid}")
+def update_post_route(pid: str, body: dict = Body(...)):
+    """Update visibility (public/unlisted/private), custom schedule time, or priority."""
+    try:
+        updated = posting.update(pid, body)
+        return {"ok": True, "post": updated}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/posts/{pid}/move")
+def move_post_route(pid: str, body: dict = Body(...)):
+    """Move a post 'up' or 'down' in the upload sequence queue."""
+    direction = str(body.get("direction", "up")).lower()
+    try:
+        posting.move(pid, direction)
+        return {"ok": True}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/posts/reorder")
+def reorder_posts_route(body: dict = Body(...)):
+    """Explicitly reorder the sequence queue given an array of post IDs."""
+    pids = [str(x) for x in body.get("pids", [])]
+    posting.reorder(pids)
+    return {"ok": True}
+
+
+@app.post("/api/posts/expedite-all")
+def expedite_all_posts():
+    """Move every scheduled post for the current user to post immediately."""
+    posting.expedite_all()
     return {"ok": True}
 
 
