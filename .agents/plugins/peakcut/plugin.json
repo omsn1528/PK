@@ -1,0 +1,18 @@
+{
+  "name": "peakcut",
+  "displayName": "PeakCut Studio",
+  "version": "1.2.0",
+  "description": "Skills and extensions for developing, testing, and optimizing PeakCut: video highlight scouting, Hindi/Hinglish metadata, FFmpeg vertical reframing, speech transcription, multi-platform publishing, and performance optimization.",
+  "skills": [
+    "peakcut-video-analysis",
+    "peakcut-metadata",
+    "peakcut-transcription",
+    "peakcut-ffmpeg",
+    "peakcut-publishing",
+    "peakcut-ai-providers",
+    "peakcut-performance",
+    "peakcut-testing",
+    "peakcut-ui",
+    "peakcut-architecture"
+  ]
+}

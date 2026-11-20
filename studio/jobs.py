@@ -4,6 +4,7 @@ import json
 import os
 import math
 import queue
+import re
 import shutil
 import threading
 import time
@@ -11,7 +12,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, facecam, fetch_model, games, hashtags, load, media, quality, render, roman, safe, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -108,11 +109,12 @@ _lock = threading.RLock()
 on_clip_ready: list = []   # callbacks (job, clip), run once when a clip first finishes
 
 DEFAULTS = {"max_clips": 6, "min_len": 15, "max_len": 60, "style": "bounce", "layout": "blur", "quality": 720,
-            "range_start": None, "range_end": None, "captions": True, "user_instructions": "",
-            "auto_upload": False}
+            "range_start": None, "range_end": None, "captions": True, "hook_text": "", "description_text": "",
+            "lang": "en"}   # lang: the language spoken
 
 
 LIMITS = {"max_clips": (1, 20), "min_len": (5, 120), "max_len": (10, 180), "quality": (360, 1080)}
+
 
 def clean_options(options) -> dict:
     """Only known settings, each inside its allowed range. Raises ValueError on nonsense."""
@@ -123,12 +125,8 @@ def clean_options(options) -> dict:
                 raise ValueError("Captions must be on or off.")
             out[k] = v
             continue
-        if k == "auto_upload":
-            out[k] = bool(v)
-            continue
-        if k == "user_instructions":
-            # Free-text field: truncate to 2000 chars, strip, allow empty
-            out[k] = str(v or "").strip()[:2000]
+        if k in ("hook_text", "description_text"):     # kept even when empty: it clears the creator's own text for this video
+            out[k] = creators.clean_hook(v) if k == "hook_text" else creators.clean_description(v)
             continue
         if k not in DEFAULTS or v in ("", None):
             continue
@@ -139,6 +137,8 @@ def clean_options(options) -> dict:
             v = v if v in render.STYLES else DEFAULTS["style"]
         elif k == "layout":
             v = v if v in render.LAYOUTS else DEFAULTS["layout"]
+        elif k == "lang":
+            v = v if fetch_model.known(v) else DEFAULTS["lang"]
         else:                                    # range_start, range_end: seconds into the video
             v = float(v)
             if not math.isfinite(v) or v < 0:
@@ -161,7 +161,6 @@ def public(job) -> dict:
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
     out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
-    out["can_resume"] = bool(job.get("can_resume") or job.get("status") in ("error", "paused"))
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
     if job.get("status") == "queued":
@@ -188,7 +187,27 @@ def save(job):
             return
         tmp = d / "job.json.tmp"
         tmp.write_text(text, encoding="utf-8")
-        tmp.replace(d / "job.json")
+        _put_in_place(tmp, d / "job.json")
+
+
+def _put_in_place(tmp: Path, target: Path):
+    """Move the freshly written job.json over the old one.
+
+    Windows refuses this ("Access is denied") for a moment whenever anything else has the old file open: a virus
+    scanner, the search indexer, or another part of PeakCut reading it. A download saves many times a second, so it
+    happens, and it used to stop the whole video. So it is tried again a few times, and if the file is still busy
+    it is written in place; as a last resort this save is skipped, because the next one carries the same news."""
+    for i in range(8):
+        try:
+            tmp.replace(target)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (i + 1))
+    try:
+        target.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _set(job, **kw):
@@ -296,7 +315,9 @@ def create(source: dict, options: dict, enqueue=True, creator=None, kind="video"
     c = creators.get(creator) if creator else None
     if c:
         d = creators.root(c["id"]) / ("live" if kind == "live" else "videos") / jid
-        base = {**DEFAULTS, **{k: c[k] for k in ("max_clips", "min_len", "max_len", "style", "layout", "captions")}}
+        base = {**DEFAULTS, **{k: c[k] for k in ("max_clips", "min_len", "max_len", "style", "layout", "captions", "lang") if k in c},
+                "hook_text": creators.clean_hook(c.get("hook_text")),
+                "description_text": creators.clean_description(c.get("description_text"))}
     else:
         d, base, creator = config.user_dir(ctx.uid()) / "jobs" / jid, dict(DEFAULTS), None
     opts = {**base, **clean_options(options)}
@@ -369,41 +390,65 @@ def request_render(jid, cid, changes: dict):
     for k in ("hook", "title", "description", "style", "layout"):
         if k in changes:
             new[k] = str(changes[k])[:{"hook": 60, "title": 100, "description": 2000}.get(k, 20)]
+    if "hashtags" in changes:
+        new["hashtags"] = clean_hashtags(changes["hashtags"])
     if new.get("style") not in render.STYLES:
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
-    if "subtitles_text" in changes and str(changes["subtitles_text"]).strip():
-        from . import subtitles
-        orig = clip.get("fixed_words")
-        if not orig and (Path(job["dir"]) / "words.json").is_file():
-            all_w = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
-            orig = [w for w in all_w if new["start"] - 1 <= w["s"] <= new["end"] + 1]
-        parsed = subtitles.parse_subtitles_text(str(changes["subtitles_text"]), orig or [])
-        new["fixed_words"] = parsed
-        new["fixed_for"] = [round(new["start"], 2), round(new["end"], 2), "en2"]
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
 
 
-def get_clip_subtitles(jid: str, cid: str) -> dict:
-    job = _jobs.get(jid)
-    if not job:
-        raise ValueError("No such job")
-    clip = next((c for c in job.get("clips", []) if c["id"] == cid), None)
-    if not clip:
-        raise ValueError("No such clip")
-    from . import subtitles
-    words = clip.get("fixed_words")
-    if not words and (Path(job["dir"]) / "words.json").is_file():
-        try:
-            all_w = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
-            words = [w for w in all_w if clip["start"] - 0.5 <= w["s"] <= clip["end"] + 0.5]
-        except Exception:
-            words = []
-    text = subtitles.build_subtitles_text(words or [])
-    return {"text": text, "words": words or []}
+def clean_hashtags(v) -> list:
+    """Hashtags typed by a person ("#funny gaming") or sent by the page as a list: plain words, at most 8."""
+    if isinstance(v, str):
+        v = v.split()
+    if not isinstance(v, list):
+        raise ValueError("Hashtags must be words separated by spaces.")
+    tags = [re.sub(r"\W", "", str(h))[:30] for h in v[:50] if isinstance(h, (str, int))]
+    return [t for t in tags if t][:8]
+
+
+def save_post_text(job, clip, changes: dict):
+    """Change a clip's title, description and hashtags without making the clip again. Posting reads them
+    from the clip when it uploads, so the next post (or one still waiting in the queue) uses the new text."""
+    text = {k: str(changes[k] or "")[:{"title": 100, "description": 2000}[k]] for k in ("title", "description") if k in changes}
+    if "hashtags" in changes:
+        text["hashtags"] = clean_hashtags(changes["hashtags"])
+    if clip.get("hashtags_in_description") and not clip.get("fixed_description") and text:
+        # This clip's description ends with its hashtags, and posting does not add them again. So the
+        # description is put back together from the Hashtags box: the words, then one line of tags.
+        desc = hashtags._TAG_IN_TEXT.sub("", text.get("description", clip.get("description") or "")).strip()
+        line = " ".join("#" + t for t in text.get("hashtags", clip.get("hashtags") or []))
+        text["description"] = ((desc + "\n\n" + line).strip() if desc else line)[:2000]
+    with _lock:
+        clip.update(text)
+    save(job)
+    side = Path(job["dir"]) / "clips" / f"{clip['id']}.json"   # the copy that sits next to the video file
+    try:
+        if side.is_file():
+            side.write_text(json.dumps({**json.loads(side.read_text(encoding="utf-8")), **text}, indent=1), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
+def spoken_in(job, clip) -> str:
+    """What is said during a clip, from the video's transcript."""
+    try:
+        words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return " ".join(str(w.get("w", "")) for w in words
+                    if isinstance(w, dict) and clip["start"] - 0.5 <= _f(w.get("s")) <= clip["end"] + 0.5)
+
+
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return -1.0
 
 
 def render_one(job, clip, words):
@@ -466,7 +511,6 @@ def _wait_for_clips(job, futures, began, workers):
     left, given_up = list(futures), 0
     late = "This clip took too long and was stopped. Open it and press Save and re-make to try again."
     while left:
-        check_abort(job["id"])
         still = []
         for f, clip in left:
             if f.done():
@@ -607,12 +651,14 @@ def _run_job(job):
         _set(job, status="running", stage="Picking up where it stopped", error=None)
     else:
         _set(job, status="running", stage="Getting the audio", progress=0.03, error=None, clips=[], ai={}, done_blocks=0)
-    check_abort(job["id"])
-    if not transcribe.model_ready() and not transcribe.REMOTE:
-        from . import fetch_model
+    speech = o.get("lang") if fetch_model.known(o.get("lang")) else fetch_model.DEFAULT   # the language spoken
+    if speech == fetch_model.DEFAULT and not transcribe.model_ready() and not transcribe.REMOTE:
         _set(job, stage="Getting the speech model (one time, about 480 MB)")
         fetch_model.ensure()
         _set(job, stage="Getting the audio")
+    could_borrow = src["type"] == "url" and config.YT_TRANSCRIPT and media.is_youtube(src["url"])
+    if speech != fetch_model.DEFAULT and not transcribe.REMOTE and not could_borrow and fetch_model.status(speech) == "missing":
+        fetch_model.ensure(speech, start=False)      # says what to do, before any time is spent on the download
     fetch = ThreadPoolExecutor(1)
     video = None
     if src["type"] == "url":
@@ -632,7 +678,14 @@ def _run_job(job):
         pieces = span > LONG_VIDEO or meta["duration"] <= 0
         if not pieces:  # shorter video: fetch all of it in the background while the audio is worked on
             video = fetch.submit(media.download, src["url"], d, int(o["quality"]))
-        audio_file = media.download_audio(src["url"], d, lambda p: _set(job, progress=0.03 + 0.1 * p))
+        seen = [-1.0]
+
+        def got(p):                       # the bar moves in whole percents: no need to save the file a hundred times a second
+            if p - seen[0] >= 0.01 or p >= 1:
+                seen[0] = p
+                _set(job, progress=0.03 + 0.1 * p)
+
+        audio_file = media.download_audio(src["url"], d, got)
     else:
         pieces, audio_file = False, Path(src["path"])
         info = media.probe(audio_file)
@@ -683,12 +736,13 @@ def _run_job(job):
         began[clip["id"]] = time.time()
         if src["type"] == "url" and (pieces or not whole_video()):
             _fetch_piece(job, clip, audio)
-        if clip["status"] != "error" and clip.get("captions", True) and yt and yt[1].lower().startswith("en"):
+        if clip["status"] != "error" and clip.get("captions", True) and yt_model:
             # The clip was found with YouTube's transcript. What is shown on screen comes from our own model,
             # run on just this clip: full punctuation, nothing blanked out, timings to the word.
             a0, b0 = max(lo, int((clip["start"] - 1.5) * 16000)), min(hi, int((clip["end"] + 1.5) * 16000))
             try:
-                tw = [dict(w, s=round(w["s"] + a0 / 16000, 2), e=round(w["e"] + a0 / 16000, 2)) for w in transcribe.transcribe(audio[a0:b0])]
+                tw = [dict(w, s=round(w["s"] + a0 / 16000, 2), e=round(w["e"] + a0 / 16000, 2))
+                      for w in transcribe.transcribe(audio[a0:b0], lang=yt_model)]
             except Exception:  # noqa: BLE001 - the clip is still made, with YouTube's words
                 tw = []
             if len(tw) >= 3:
@@ -713,7 +767,16 @@ def _run_job(job):
         if yt and not _covers(yt[0], lo / 16000, hi / 16000):
             yt = None
         job["transcript_from"] = "youtube" if yt else "own"
-        job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
+    # The language spoken decides the captions: YouTube's word for it when its transcript is used, else the choice made.
+    job["lang"] = yt[1] if yt else speech
+    # A clip found with YouTube's transcript gets its on-screen words from our own model, when there is one here
+    # for the language YouTube says was spoken (English always; others once they are downloaded).
+    yt_code = (yt[1].lower().split("-")[0] if yt else "")
+    yt_model = yt_code if fetch_model.known(yt_code) and (yt_code == fetch_model.DEFAULT or fetch_model.ready(yt_code)) else ""
+    if not yt and speech != fetch_model.DEFAULT and not transcribe.REMOTE and not fetch_model.ready(speech):
+        if fetch_model.state[speech]["doing"]:
+            _set(job, stage=f"Waiting for the {fetch_model.label(speech)} speech model to finish downloading")
+        fetch_model.ensure(speech, start=False)      # waits for a download already running, else says what to do
     if resuming:
         try:
             words = json.loads((d / "words.json").read_text(encoding="utf-8"))
@@ -740,17 +803,15 @@ def _run_job(job):
             last = [0.0]
 
             def tp(p, i=i, a_=a_, b_=b_):
-                check_abort(job["id"])          # pause/stop signals are checked during transcription
                 if now_on[0] == i and p - last[0] > 0.05:      # only the part being shown moves the bar
                     last[0] = p
                     _set(job, progress=max(job["progress"], 0.14 + 0.78 * ((a_ - lo) + p * (b_ - a_)) / max(1, hi - lo)))
-            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp)
+            heard[i] = ahead.submit(ctx.bind(transcribe.transcribe), audio[a_:b_], tp, speech)
 
     # The ad breaks and static screens of the whole video, found once. It reads the video end to end,
     # so it is done here rather than for each clip, and only when asked for.
     statics = quality.static_ranges(job.get("source_path") or "") if config.SKIP_STATIC else []
     for bi, (a, b) in enumerate(blocks):
-        check_abort(job["id"])
         if bi < done_blocks:
             continue                      # transcribed and checked by the AI before the restart
         shift = a / 16000
@@ -776,8 +837,7 @@ def _run_job(job):
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
         found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append,
-                                     game=game, user_instructions=str(o.get("user_instructions") or ""))
+                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game)
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
@@ -798,6 +858,12 @@ def _run_job(job):
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
                      captions=o.get("captions", True), status="queued", version=0)
+            if o.get("hook_text"):        # the person's own big text, on every clip, in place of the AI's
+                c["hook"] = o["hook_text"]
+            if o.get("description_text"):  # ...and their own description, exactly as written
+                c["description"], c["fixed_description"] = o["description_text"], True
+            else:                          # no description of their own: 3 to 5 fitting hashtags go at the end of the AI's
+                hashtags.apply(c, words, job["title"], job["uploader"], game)
             # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
             # stream with no webcam is not looked for again on every clip of it.
             if o["layout"] == "gameplay" and face is False:
@@ -836,96 +902,6 @@ def _run_job(job):
     creators.log(job["creator"], f"Video finished with {len(clips)} clips in {round(time.time() - t0)}s: {job['title']}")
 
 
-class JobCancelled(Exception):
-    """Raised when a user explicitly stops/cancels a job."""
-    pass
-
-
-class JobPaused(Exception):
-    """Raised when a user pauses a job."""
-    pass
-
-
-_abort_requests: dict = {}
-
-
-def check_abort(jid: str):
-    req = _abort_requests.get(jid)
-    if req == "stop":
-        raise JobCancelled("Stopped by user")
-    elif req == "pause":
-        raise JobPaused("Paused by user")
-
-
-def pause_job(jid: str) -> dict:
-    """Pause a running or queued job."""
-    job = _jobs.get(jid)
-    if not job:
-        raise ValueError("No such video")
-    if job.get("status") == "paused":
-        return public(job)
-    if job.get("status") == "queued":
-        _set(job, status="paused", stage="Paused by user", can_resume=True)
-        ctx.bump(job["user"])
-        return public(job)
-    if job.get("status") == "running":
-        _abort_requests[jid] = "pause"
-        _set(job, stage="Pausing...", can_resume=True)
-        ctx.bump(job["user"])
-        return public(job)
-    raise ValueError("Only active videos can be paused.")
-
-
-def stop_job(jid: str) -> dict:
-    """Stop/cancel a running or queued job."""
-    job = _jobs.get(jid)
-    if not job:
-        raise ValueError("No such video")
-    if job.get("status") in ("stopped", "done"):
-        return public(job)
-    if job.get("status") == "queued":
-        _set(job, status="stopped", stage="Stopped by user", can_resume=True)
-        ctx.bump(job["user"])
-        return public(job)
-    if job.get("status") == "running":
-        _abort_requests[jid] = "stop"
-        _set(job, stage="Stopping...", can_resume=True)
-        ctx.bump(job["user"])
-        return public(job)
-    return public(job)
-
-
-def is_network_error(e) -> bool:
-    """Determine whether an exception stems from network loss or connectivity timeout."""
-    msg = str(e).lower()
-    return any(err in msg for err in (
-        "connection", "connect", "timed out", "timeout", "network", "getaddrinfo",
-        "10054", "reset by peer", "broken pipe", "decryption failed", "remote host",
-        "remotedisconnected", "nameresolutionerror", "temporarily unavailable",
-        "bad record mac", "socket"
-    ))
-
-
-def retry_job(jid: str, stage: str = "auto") -> dict:
-    """Retry a failed, stopped or paused job, reusing previously completed steps (transcript, clips)."""
-    job = _jobs.get(jid)
-    if not job:
-        raise ValueError("No such video")
-    if job.get("status") in ("queued", "running", "live"):
-        raise ValueError("This video is already in progress.")
-    _abort_requests.pop(jid, None)
-    job["error"] = None
-    job["resume"] = True
-    job["can_resume"] = True
-    for c in job.get("clips", []):
-        if c.get("status") in ("error", "queued", "rendering"):
-            c["status"] = "queued"
-            c["error"] = None
-    _set(job, status="queued", stage="Retrying", error=None)
-    _q.put(("job", jid, None), user=job["user"])
-    return public(job)
-
-
 def _worker(quick_only=False):
     while True:
         kind, a, cid = _q.get(quick_only)
@@ -940,9 +916,6 @@ def _worker(quick_only=False):
             if kind == "job":
                 _q.done()
             continue
-        if kind == "job" and job.get("status") in ("stopped", "paused"):
-            _q.done()
-            continue
         token = ctx._uid.set(job["user"])  # everything this job does runs as its owner
         try:
             if kind == "job":
@@ -953,30 +926,14 @@ def _worker(quick_only=False):
                 if clip.get("captions", True):
                     words = json.loads((Path(job["dir"]) / "words.json").read_text(encoding="utf-8"))
                 render_one(job, clip, words)
-        except JobPaused:
-            _abort_requests.pop(job["id"], None)
-            _set(job, status="paused", stage="Paused by user", error=None, can_resume=True)
-            creators.log(job["creator"], f"Video paused by user: {job.get('title') or job['source'].get('name')}")
-        except JobCancelled:
-            _abort_requests.pop(job["id"], None)
-            for c in job.get("clips", []):
-                if c.get("status") in ("queued", "rendering"):
-                    c.update(status="error", error="Stopped by user.")
-            _set(job, status="stopped", stage="Stopped by user", error=None, can_resume=True)
-            creators.log(job["creator"], f"Video stopped by user: {job.get('title') or job['source'].get('name')}")
         except Exception as e:  # noqa: BLE001
             (Path(job["dir"]) / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
             if kind == "job":
-                if is_network_error(e):
-                    _set(job, status="paused", stage="Paused – Internet connection lost",
-                         error=f"Connection lost: {safe.friendly(e, 200)}", can_resume=True)
-                    creators.log(job["creator"], f"Video paused (connection lost): {safe.friendly(e)[:150]}")
-                else:
-                    for c in job["clips"]:
-                        if c.get("status") in ("queued", "rendering"):
-                            c.update(status="error", error="The video stopped before this clip was made.")
-                    _set(job, status="error", error=safe.friendly(e), stage="Stopped", can_resume=True)
-                    creators.log(job["creator"], f"Video failed: {safe.friendly(e)[:200]}")
+                for c in job["clips"]:
+                    if c.get("status") in ("queued", "rendering"):
+                        c.update(status="error", error="The video stopped before this clip was made.")
+                _set(job, status="error", error=safe.friendly(e), stage="Stopped")
+                creators.log(job["creator"], f"Video failed: {safe.friendly(e)[:200]}")
         finally:
             ctx._uid.reset(token)
             if kind == "job":

@@ -23,7 +23,7 @@ from . import config
 
 # name -> (label shown on the pages, address, how it is spoken to, where to get a key, an example model id)
 PROVIDERS = {
-    "gemini": ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini", "https://aistudio.google.com/apikey", "gemini-flash-lite-latest"),
+    "gemini": ("Gemini", "https://generativelanguage.googleapis.com/v1beta/models", "gemini", "https://aistudio.google.com/apikey", "gemini-2.5-flash"),
     "openai": ("OpenAI", "https://api.openai.com/v1", "openai", "https://platform.openai.com/api-keys", "gpt-4o-mini"),
     "xai": ("Grok", "https://api.x.ai/v1", "openai", "https://console.x.ai", "grok-4"),
     "groq": ("Groq", "https://api.groq.com/openai/v1", "openai", "https://console.groq.com/keys", "llama-3.3-70b-versatile"),
@@ -34,9 +34,6 @@ PROVIDERS = {
 }
 ALIASES = {"google": "gemini", "grok": "xai", "claude": "anthropic", "local": "ollama"}
 NO_KEY = {"ollama", "custom"}       # a model running on your own machine needs no key
-# Google keeps old model ids in the list after new keys can no longer use them. Hiding them here stops the
-# settings page from offering a model that would only answer with "no longer available to new users".
-RETIRED_GEMINI = {"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-2.5-pro-preview"}
 
 # ---------------------------------------------------------------- the settings in use
 _lock = threading.Lock()
@@ -70,8 +67,7 @@ def current() -> dict:
     return {"provider": ALIASES.get(p, p),
             "models": list(d["models"]) if d.get("provider") else list(config.AI_MODELS),
             "base_url": (str(d.get("base_url") or "") if d.get("provider") else config.AI_BASE_URL).rstrip("/"),
-            "key": str(d["key"]) if d.get("provider") and "key" in d else config.ai_key(),
-            "extra_keys": list(d.get("extra_keys") or [])}
+            "key": str(d["key"]) if d.get("provider") and "key" in d else config.ai_key()}
 
 
 def provider() -> str:
@@ -104,20 +100,16 @@ def public() -> dict:
     """What the settings page may see. The key itself never leaves the server: only whether there is one, and
     its last four characters so the owner can tell which key it is."""
     c = current()
-    extra = c.get("extra_keys") or []
     return {"provider": c["provider"], "models": c["models"], "base_url": c["base_url"], "has_key": bool(c["key"]),
             "key_hint": c["key"][-4:] if len(c["key"]) >= 12 else "", "ready": ready(), "label": label(),
             "saved_here": bool(_from_dashboard().get("provider")),
-            "extra_key_count": len(extra),
-            "extra_key_hints": [k[-4:] if len(k) >= 12 else "" for k in extra],
             "providers": [{"id": k, "label": v[0], "address": v[1], "needs_key": k not in NO_KEY, "key_url": v[3], "example": v[4]}
                           for k, v in PROVIDERS.items()]}
 
 
-def save(provider_id: str, model_ids, address: str = "", new_key=None, extra_keys=None) -> dict:
+def save(provider_id: str, model_ids, address: str = "", new_key=None) -> dict:
     """Save the choice made in the dashboard. `new_key` None keeps the key that is already there (the page never
-    has it to send back); an empty string removes it. `extra_keys` is a list of backup API keys that are tried
-    automatically when the primary key hits a rate limit or quota error."""
+    has it to send back); an empty string removes it."""
     p = ALIASES.get(str(provider_id or "").strip().lower(), str(provider_id or "").strip().lower())
     if p not in PROVIDERS:
         raise ValueError("Choose one of the AI services in the list.")
@@ -137,16 +129,10 @@ def save(provider_id: str, model_ids, address: str = "", new_key=None, extra_key
     k = old["key"] if new_key is None and old["provider"] == p else str(new_key or "").strip()[:400]
     if not k and p not in NO_KEY:
         raise ValueError("Paste the key for this service.")
-    # Extra keys: a list of backup keys to rotate through on rate limit / quota errors.
-    # We keep the old ones if the caller passes None (page didn't touch the field).
-    if extra_keys is None:
-        ek = old.get("extra_keys") or [] if old["provider"] == p else []
-    else:
-        ek = [str(x).strip()[:400] for x in (extra_keys or []) if str(x).strip()][:5]
     with _lock:
         f = _file()
         tmp = f.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"provider": p, "models": ms, "base_url": address, "key": k, "extra_keys": ek}), encoding="utf-8")
+        tmp.write_text(json.dumps({"provider": p, "models": ms, "base_url": address, "key": k}), encoding="utf-8")
         try:
             os.chmod(tmp, 0o600)        # the key is only for whoever runs the server
         except OSError:
@@ -166,34 +152,7 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
     base = str(address or "").strip().rstrip("/") or (c["base_url"] if c["provider"] == p else "") or PROVIDERS[p][1]
     if not base:
         raise ValueError("Enter the service's address first.")
-
-    # Providers that need a key before they can list models
-    if p not in NO_KEY and p != "openrouter" and not k:
-        raise ValueError(f"Paste your {PROVIDERS[p][0]} API key first to discover available models.")
-
     how = PROVIDERS[p][2]
-    if p == "ollama":
-        # Handle Ollama local models via /v1/models or native /api/tags
-        found = []
-        try:
-            r = httpx.get(f"{base}/models", timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                found = [m.get("id", "") for m in data.get("data", []) if isinstance(m, dict)]
-        except Exception:
-            pass
-        if not found:
-            raw_base = re.sub(r"/v1/?$", "", base)
-            try:
-                r_native = httpx.get(f"{raw_base}/api/tags", timeout=8)
-                if r_native.status_code == 200:
-                    found = [m.get("name", "") for m in r_native.json().get("models", []) if isinstance(m, dict)]
-            except Exception as e:
-                raise ValueError(f"Could not connect to Ollama at {base}. Ensure Ollama is running ('ollama serve').") from e
-        if not found:
-            raise ValueError("Ollama is running, but no models are installed yet. Run 'ollama pull llama3.2' in terminal, then click Refresh.")
-        return sorted({m for m in found if m})[:400]
-
     if how == "gemini":
         r = httpx.get(base, params={"pageSize": 200}, headers={"x-goog-api-key": k}, timeout=20)
     elif how == "anthropic":
@@ -204,9 +163,14 @@ def list_models(provider_id=None, address=None, with_key=None) -> list:
         raise AIError(f"HTTP {r.status_code} {r.text[:200].replace(k or chr(0), '<key>')}")
     data = r.json()
     if how == "gemini":
-        found = [m.get("name", "").split("/")[-1] for m in data.get("models", [])
-                 if "generateContent" in (m.get("supportedGenerationMethods") or [])
-                 and m.get("name", "").split("/")[-1] not in RETIRED_GEMINI]
+        found = []
+        for m in data.get("models", []):
+            if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+                continue
+            mid = m.get("name", "").split("/")[-1]
+            low_id = mid.lower()
+            if mid and low_id != "aqa" and not any(t in low_id for t in ("-tts", "-image", "imagen-", "veo-", "lyria-", "embedding")):
+                found.append(mid)
     else:
         found = [m.get("id", "") for m in data.get("data", []) if isinstance(m, dict)]
     return sorted({m for m in found if m})[:400]
@@ -221,16 +185,13 @@ def test() -> dict:
     return {"ok": True, "model": ms[0], "tokens": sent + wrote, "answer": str(out)[:80]}
 
 
-def all_keys() -> list:
-    """Primary key plus any extra backup keys, deduplicated. Used for automatic rotation on quota/rate errors."""
-    c = current()
-    primary = c["key"]
-    extras = [k for k in (c.get("extra_keys") or []) if k and k != primary]
-    return [k for k in [primary] + extras if k]
-
-
 class AIError(RuntimeError):
-    pass
+    """A failed AI call. `wait` is how many seconds the service asked us to wait before trying again, when it
+    said so (a Retry-After header, or Gemini's retryDelay)."""
+    def __init__(self, message, wait=None, daily=False):
+        super().__init__(message)
+        self.wait = wait
+        self.daily = daily        # the limit is for the whole day, so waiting a minute won't help
 
 
 problem = {"text": "", "at": 0.0}       # why the AI last failed, for the dashboard; cleared when it answers again
@@ -240,15 +201,17 @@ def explain(e) -> str:
     """What went wrong with an AI call, in words the owner can act on."""
     text, low = str(e), str(e).lower()
     name = (models() or ["?"])[0]
-    if "no longer available" in low or "deprecated" in low:
-        suggestion = re.search(r"use (?:models/)?([\w.\-]+)", text, re.I)
-        hint = f' Use "{suggestion.group(1)}" instead.' if suggestion else \
-               " Pick a newer model from the list under Settings, AI."
-        return f'{label()} has retired the model "{name}".{hint}'
-    if "404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low:
-        return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
-    if "401" in text or "403" in text or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:
+    m = re.match(r"HTTP (\d{3})\b", text)
+    status = m.group(1) if m else ""
+    if status in ("401", "403") or "api key" in low or "api_key" in low or "unauthorized" in low or "permission" in low:
         return f"{label()} refused the key. Paste a working key under Settings, AI."
+    if "no longer available" in low or "deprecated" in low or "retired" in low or "discontinued" in low:
+        return f"{label()} has retired \"{name}\" (or it isn't available to new keys). Open Settings, AI, press Find models and pick a newer model."
+    # Only a 404 that is about a model says the model is unknown. A 400 like "API key not found" or a stray
+    # "404" inside some other message must not be reported as an unknown model.
+    if (status == "404" and "model" in low) or (not status and ("404" in text or "not found" in low or "does not exist" in low or "unknown model" in low or "not_found" in low)) \
+            or (status and "is not found for api version" in low):
+        return f"{label()} doesn't know the model \"{name}\". Open Settings, AI, press Find models and pick one from the list."
     if "429" in text or "quota" in low or "rate limit" in low or "exhausted" in low:
         return f"{label()} says the key has hit its limit or has no credit left. Check the account with {label()}, or try again later."
     if "connect" in low or "timed out" in low or "timeout" in low or "getaddrinfo" in low or "refused" in low or "nodename" in low or "servname" in low or "nameresolutionerror" in low or "name resolution" in low:
@@ -267,9 +230,23 @@ def clear_problem():
     problem.update(text="", at=0.0)
 
 
+def asked_wait(r) -> float | None:
+    """How long the service asked us to wait, in seconds, or None when it didn't say."""
+    try:
+        v = (r.headers.get("retry-after") or "").strip()
+        if v:
+            return max(0.0, float(v))
+    except (ValueError, AttributeError):
+        pass
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', getattr(r, "text", "") or "")
+    return float(m.group(1)) if m else None
+
+
 def _fail(r, model):
     text = r.text[:300].replace(key() or "\0", "<key>")
-    raise AIError(f"HTTP {r.status_code} {text}")
+    limited = r.status_code in (429, 503)
+    raise AIError(f"HTTP {r.status_code} {text}", wait=asked_wait(r) if limited else None,
+                  daily=limited and bool(re.search(r"PerDay|per day|daily", r.text or "", re.I)))
 
 
 # ---------------------------------------------------------------- the schema, said in words for chat models
@@ -371,7 +348,7 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
         body = {"contents": [{"role": "user", "parts": [
             {"text": prompt},
             {"inline_data": {"mimeType": "image/jpeg", "data": b64}}]}]}
-        r = httpx.post(f"{base_url()}/{model}:generateContent", json=body,
+        r = httpx.post(f"{base_url()}/{_gem(model)}:generateContent", json=body,
                        headers={"x-goog-api-key": key()}, timeout=timeout or 120)
         if r.status_code != 200:
             _fail(r, model)
@@ -405,17 +382,31 @@ def see(prompt: str, image: bytes, timeout: float | None = None) -> tuple[str, i
     return text, int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
 
 
+def _gem(model: str) -> str:
+    """Gemini names models "models/gemini-2.5-flash"; the address already ends in /models, so only the bare id is used."""
+    return model.removeprefix("models/")
+
+
 def _gemini(model, prompt, schema, timeout=None):
+    url = f"{base_url()}/{_gem(model)}:generateContent"
+    headers = {"x-goog-api-key": key()}
     body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": schema}}
-    r = httpx.post(f"{base_url()}/{model}:generateContent", json=body, headers={"x-goog-api-key": key()}, timeout=timeout or 120)
+    r = httpx.post(url, json=body, headers=headers, timeout=timeout or 120)
+    used_plain = False
+    if r.status_code in (400, 422) and "api key" not in r.text.lower() and "api_key" not in r.text.lower():
+        # Models like Gemma in the Gemini list support generateContent without responseSchema.
+        plain = {"contents": [{"role": "user", "parts": [{"text": _wrapped(prompt, schema)}]}]}
+        r = httpx.post(url, json=plain, headers=headers, timeout=timeout or 120)
+        used_plain = True
     if r.status_code != 200:
         _fail(r, model)
     data = r.json()
     text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
     u = data.get("usageMetadata", {})
     sent = int(u.get("promptTokenCount") or 0)
-    return json.loads(text), sent, max(0, int(u.get("totalTokenCount") or 0) - sent)   # the answer, and any thinking billed with it
+    parsed = _parse(text) if used_plain else json.loads(text)
+    return parsed, sent, max(0, int(u.get("totalTokenCount") or 0) - sent)   # the answer, and any thinking billed with it
 
 
 def _openai_body(r):
