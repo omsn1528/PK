@@ -842,6 +842,9 @@ def _run_job(job):
         model = ai.get("model") or model
         if ai.get("note"):
             notes.append(ai["note"])
+        if config.ai_ready() and not ai.get("model") and bi < len(blocks) - 1:
+            notes.append(f"AI check on block {bi+1} had a temporary error; skipping to subsequent blocks for AI highlights.")
+            found = []
         if found and statics:
             # A commercial or a "be right back" slate is not a clip. Any clip that sits mostly inside one
             # is dropped.

@@ -2,6 +2,7 @@
 import secrets
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import json
@@ -24,7 +25,7 @@ OPEN = ("scheduled", "posting", "uploaded_scheduled", "uploaded_private")
 
 def list_mine() -> list:
     """All posts for the signed-in user, safe fields only (no internal keys), newest first."""
-    safe_keys = {"id", "status", "title", "account_name", "platform", "due_at", "posted_at",
+    safe_keys = {"id", "status", "title", "account", "account_name", "platform", "due_at", "posted_at",
                  "views", "url", "error", "creator", "progress", "tries", "visibility", "priority", "paused",
                  "schedule_mode", "publish_at_utc", "publish_at_ist", "timezone", "uploaded_at",
                  "yt_video_id", "remote_id", "clip", "job", "description", "hashtags", "cover", "duration"}
@@ -141,8 +142,6 @@ def enqueue(job, clip, account_ids, now=False, visibility="public",
 
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
-    c = creators.get(job["creator"])
-
     # Smart scheduling rule: Never automatically upload full-length videos!
     # Only generated Shorts are eligible (duration <= 60 seconds)
     clip_dur = clip.get("duration") or (clip.get("end", 0) - clip.get("start", 0))
@@ -153,40 +152,51 @@ def on_clip_ready(job, clip):
     if clip.get("status") != "done":
         return
 
-    # Auto-upload from job options (the per-job toggle)
-    if job.get("options", {}).get("auto_upload"):
-        try:
-            with ctx.as_user(job["user"]):
+    # User rule: never make or auto-upload generic clickbait clips ("WAIT FOR IT" or "Loud moment")
+    t_lower = (clip.get("title") or "").strip().lower()
+    h_lower = (clip.get("hook") or "").strip().lower()
+    if "loud moment" in t_lower or h_lower in ("wait for it", "wait for end", "wait till end", "wait till the end", "watch till end", "watch till the end"):
+        return
+
+    user_id = job.get("user")
+    if not user_id:
+        return
+
+    with ctx.as_user(user_id):
+        c = creators.get(job.get("creator"))
+
+        # Auto-upload from job options (the per-job toggle)
+        if job.get("options", {}).get("auto_upload"):
+            try:
                 accs = accounts.list_accounts()
                 yt_accs = [a for a in accs if a.get("platform") == "youtube"]
                 other_accs = [a for a in accs if a.get("platform") in ("instagram", "tiktok")]
-        except Exception:  # noqa: BLE001
-            yt_accs, other_accs = [], []
+                mode = (job.get("options") or {}).get("upload_mode") or "scheduling"
 
-        mode = (job.get("options") or {}).get("upload_mode") or "scheduling"
+                # Auto-upload eligible Shorts to YouTube with fixed daily slots
+                for yacc in yt_accs:
+                    slot = scheduler.next_available_slot(yacc["id"], _mine()) if mode == "scheduling" else None
+                    enqueue(job, clip, [yacc["id"]], now=True,
+                            visibility="private",
+                            schedule_mode=mode,
+                            publish_at_utc=slot["publish_at_utc"] if slot else None,
+                            publish_at_ist=slot["publish_at_ist"] if slot else None)
 
-        # Auto-upload eligible Shorts to YouTube with fixed daily slots
-        for yacc in yt_accs:
-            slot = scheduler.next_available_slot(yacc["id"], _mine()) if mode == "scheduling" else None
-            enqueue(job, clip, [yacc["id"]], now=True,
-                    visibility="private",
-                    schedule_mode=mode,
-                    publish_at_utc=slot["publish_at_utc"] if slot else None,
-                    publish_at_ist=slot["publish_at_ist"] if slot else None)
+                for oacc in other_accs:
+                    vis = (job.get("options") or {}).get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
+                    enqueue(job, clip, [oacc["id"]], now=False, visibility=vis)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            return
 
-        for oacc in other_accs:
-            vis = (job.get("options") or {}).get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
-            enqueue(job, clip, [oacc["id"]], now=False, visibility=vis)
-        return
-
-    # Legacy creator-level autopost setting
-    if not c or not c["autopost"] or not c["accounts"]:
-        return
-    if clip.get("score", 0) < c["post_min_score"]:
-        return  # includes hand-made clips (score 0): those wait for you to press Post
-    made = enqueue(job, clip, c["accounts"], visibility=c.get("privacy", "public"))
-    if made:
-        creators.log(c["id"], f"Queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
+        # Legacy creator-level autopost setting
+        if not c or not c["autopost"] or not c["accounts"]:
+            return
+        if clip.get("score", 0) < c["post_min_score"]:
+            return  # includes hand-made clips (score 0): those wait for you to press Post
+        made = enqueue(job, clip, c["accounts"], visibility=c.get("privacy", "public"))
+        if made:
+            creators.log(c["id"], f"Queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
 
 
 def _caption(clip, creator):
@@ -197,6 +207,9 @@ def _caption(clip, creator):
 
 
 def _post(p):
+    actual = next((x for x in _posts if x.get("id") == p.get("id")), None)
+    if actual is not None:
+        p = actual
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     acc = accounts.get(p["account"])

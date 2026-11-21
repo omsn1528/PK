@@ -77,7 +77,9 @@ def main() -> int:
                 ("Hindi and Hinglish trending metadata and emoji rules", ["tests/test_hindi_metadata.py"]),
                 ("download resilience on network and SSL drops", ["tests/test_ssl_recovery.py"]),
                 ("live recording stops and empty stream URLs", ["tests/test_live.py"]),
-                ("YouTube Shorts automated 12-slot daily scheduling and publishing", ["tests/test_scheduling.py"])]
+                ("YouTube Shorts automated 12-slot daily scheduling and publishing", ["tests/test_scheduling.py"]),
+                ("YouTube Shorts auto-upload and schedule E2E workflow", ["tests/test_auto_upload_e2e.py"]),
+                ("prevention of generic clickbait and loudness dummy clips", ["tests/test_no_loud_moment.py"])]
         for name, args in runs:
             print(f"\n=== {name} ===", flush=True)
             r = subprocess.run([sys.executable, *args], cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
