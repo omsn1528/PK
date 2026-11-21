@@ -54,6 +54,12 @@ def note_refusal(url: str, err) -> bool:
     return False
 
 
+def clear_refusal():
+    """Clear any active refusal cooldown so retries or new links run immediately."""
+    global _yt_refused_until
+    _yt_refused_until = 0.0
+
+
 @contextlib.contextmanager
 def _youtube_guard(url):
     check_youtube(url)
@@ -120,6 +126,7 @@ def _ydl(opts):
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         "concurrent_fragment_downloads": 2,
+        "js_runtimes": {"node": {}},
     }
     return yt_dlp.YoutubeDL({**base, **cookie_opts(), **opts})
 

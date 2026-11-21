@@ -1824,12 +1824,13 @@ function jobHtml(j) {
   const pic = j.thumb ? `<img src="/media/${esc(j.id)}/thumb.jpg" alt="" loading="lazy">` : ic(j.source?.type === "file" ? "film" : "link");
   return `<div class="job-head"><div class="jt"><span class="jthumb">${pic}${j.duration ? `<span class="du">${fmt(j.duration)}</span>` : ""}</span><div style="min-width:0"><h3>${esc(j.title || j.source.name)}</h3><p class="sub">${meta}</p></div></div>
       <div class="row" style="flex-wrap:nowrap;gap:4px">${busy ? "" : `
+        ${j.status === "error" ? `<button class="btn sm primary" data-act="retryjob" data-j="${j.id}" title="Retry" aria-label="Retry this video">${ic("refresh")} Retry</button>` : ""}
         ${j.clips.some(c => c.status === "done") ? `<button class="btn sm icon ghost" data-act="dlall" data-j="${j.id}" title="Download all clips of this video" aria-label="Download all clips of this video">${ic("down")}</button>` : ""}
         <button class="btn sm icon ghost" data-act="deljob" data-j="${j.id}" title="Delete" aria-label="Delete this video and its clips">${ic("trash")}</button>
         <label class="selck" title="Select this video and its clips"><input type="checkbox" data-sel="j:${j.id}" ${sel().has("j:" + j.id) ? "checked" : ""} aria-label="Select this video"></label>`}</div></div>
     ${busy ? `<div class="bar"><i style="width:${Math.round(j.progress * 100)}%"></i></div><p class="sub">${esc(j.stage)} · ${Math.round(j.progress * 100)}%</p>` : ""}
     ${j.status === "done" && !j.clips.length ? `<p class="sub">${esc(j.stage)}</p>` : ""}
-    ${j.error ? `<div class="err">${esc(j.error)}<button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
+    ${j.error ? `<div class="err">${esc(j.error)}<div class="row" style="margin-top:8px;gap:8px"><button class="btn sm primary" data-act="retryjob" data-j="${j.id}">${ic("refresh")} Retry now</button><button class="rep" data-act="report" data-ctx="${esc("Video failed: " + (j.title || j.source.name || "") + " | " + j.error)}">Report this</button></div></div>` : ""}${j.ai?.note ? `<p class="sub">${esc(j.ai.note)}</p>` : ""}
     ${j.clips.length ? `<div class="grid">${j.clips.map(c => clipHtml(j, c)).join("")}</div>` : ""}`;
 }
 /* ---- selecting several videos and clips: delete or download them together */
@@ -2769,6 +2770,9 @@ document.addEventListener("click", async e => {
     if (a === "deljob") {
       if (!await ask("Delete this video?", "The video and all of its clips are permanently deleted. This cannot be undone.", "Delete", true)) return;
       await api(`/api/jobs/${d.j}`, {method:"DELETE"}); toast("Deleted"); return tick();
+    }
+    if (a === "retryjob") {
+      await api(`/api/jobs/${d.j}/retry`, {method:"POST"}); toast("Video re-queued in sequence", "ok"); return tick();
     }
     if (a === "chadd") {
       const k = d.p, v = $("#chan_" + k)?.value.trim();

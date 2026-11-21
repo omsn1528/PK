@@ -341,6 +341,18 @@ def enqueue(job):
     _q.put(("job", job["id"], None), user=job["user"])
 
 
+def retry_job(job):
+    """Re-queue an existing video job in sequence, clearing any previous error."""
+    with _lock:
+        job["status"] = "queued"
+        job["stage"] = "Picking up where it stopped"
+        job["error"] = None
+        job["resume"] = True
+        save(job)
+        enqueue(job)
+    ctx.bump()
+
+
 def submit(fn):
     """Run any heavy task (a render, a cleanup) on the single worker, in order."""
     _q.put(("fn", ctx.bind(fn), None))

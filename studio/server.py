@@ -746,6 +746,18 @@ def link_preview(request: Request, url: str = ""):
         raise HTTPException(422, "Couldn't open that video. Check the link is public and complete.")
 
 
+@app.post("/api/jobs/{jid}/retry")
+def job_retry(jid: str):
+    _need_verified()
+    _quota()
+    j = jobs.get(jid)
+    if not j:
+        raise HTTPException(404, "Job not found")
+    media.clear_refusal()
+    jobs.retry_job(j)
+    return {"ok": True, "job": j}
+
+
 @app.post("/api/jobs")
 def create_from_link(body: dict = Body(...)):
     _need_verified()
