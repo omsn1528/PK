@@ -1622,6 +1622,19 @@ def yt_cookies_put(request: Request, body: dict = Body(...)):
     return yt_cookies_get(request)
 
 
+@app.get("/api/posts")
+def get_posts_route():
+    """List all posts for the current user (queued, scheduled, uploaded, posted, failed)."""
+    return posting.list_mine()
+
+
+@app.get("/api/schedule/slots")
+def get_schedule_slots_route(account_id: str = ""):
+    """Get status of today's 12 fixed publishing slots (6 AM - 5 PM IST)."""
+    from . import scheduler
+    return scheduler.get_daily_slots_overview(account_id, posting.list_mine())
+
+
 @app.post("/api/posts")
 def add_posts(body: dict = Body(...)):
     job = jobs.get(str(body.get("job")))
@@ -1631,8 +1644,14 @@ def add_posts(body: dict = Body(...)):
     vis = str(body.get("visibility") or "public").lower()
     if vis not in ("public", "private", "unlisted"):
         vis = "public"
+    mode = str(body.get("schedule_mode") or "scheduling").lower()
+    if mode not in ("scheduling", "private"):
+        mode = "scheduling"
+    p_utc = body.get("publish_at_utc")
+    p_ist = body.get("publish_at_ist")
     made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20],
-                           now=bool(body.get("now")), visibility=vis)
+                           now=bool(body.get("now")), visibility=vis,
+                           schedule_mode=mode, publish_at_utc=p_utc, publish_at_ist=p_ist)
     if not made:
         raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
     return {"queued": len(made)}
@@ -1643,7 +1662,9 @@ def post_action(pid: str, action: str):
     actions = {
         "cancel": posting.cancel,
         "retry": posting.retry,
-        "now": posting.expedite,
+        "now": posting.publish_now,
+        "publish-now": posting.publish_now,
+        "cancel-schedule": posting.cancel_schedule,
         "pause": posting.pause,
         "resume": posting.resume,
         "stop": posting.stop,
@@ -1653,7 +1674,7 @@ def post_action(pid: str, action: str):
         raise HTTPException(404, f"Unknown action: {action}")
     try:
         fn(pid)
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
 

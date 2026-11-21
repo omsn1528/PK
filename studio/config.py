@@ -177,6 +177,12 @@ ACCOUNTS = env("PEAKCUT_ACCOUNTS", "0") == "1"
 REPO_URL = env("PEAKCUT_REPO_URL", "https://github.com/haziqahmedqasmi/peakcut").strip()
 FOLLOW_URL = env("PEAKCUT_FOLLOW_URL", "https://www.instagram.com/haziq.builds/").strip()
 
+# ---------------------------------------------------------------- scheduling (YouTube Shorts fixed daily slots)
+SCHEDULE_TIMEZONE = env("PEAKCUT_SCHEDULE_TZ", "Asia/Kolkata")
+SCHEDULE_DAILY_LIMIT = int(env("PEAKCUT_DAILY_LIMIT", "12"))
+SCHEDULE_START_HOUR = int(env("PEAKCUT_SCHEDULE_START", "6"))    # 6:00 AM IST
+SCHEDULE_END_HOUR = int(env("PEAKCUT_SCHEDULE_END", "17"))       # 5:00 PM IST (12 hourly slots total)
+
 # ---------------------------------------------------------------- limits (per user, and for the whole server)
 # Your own PeakCut has no limits unless you set them: 0 (the default) means "none" for every limit below. The
 # machine still protects itself: new work waits while the processor, memory or disk are nearly full (load.py).

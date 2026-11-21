@@ -6,7 +6,7 @@ from pathlib import Path
 
 import json
 
-from . import accounts, alerts, config, creators, ctx, jobs, live
+from . import accounts, alerts, config, creators, ctx, jobs, live, scheduler
 
 _lock = threading.RLock()
 _FILE = config.DATA_DIR / "posts.json"
@@ -19,16 +19,18 @@ except ValueError:
 def _mine() -> list:
     u = ctx.uid()
     return [p for p in _posts if p.get("user") == u]
-OPEN = ("scheduled", "posting")
+OPEN = ("scheduled", "posting", "uploaded_scheduled", "uploaded_private")
 
 
 def list_mine() -> list:
     """All posts for the signed-in user, safe fields only (no internal keys), newest first."""
     safe_keys = {"id", "status", "title", "account_name", "platform", "due_at", "posted_at",
-                 "views", "url", "error", "creator", "progress", "tries", "visibility", "priority", "paused"}
-    # Scheduled posts sorted by due_at (ascending = queue order); posted/failed by posted_at desc
-    scheduled = sorted((p for p in _mine() if p["status"] in OPEN), key=lambda p: p.get("priority", p["due_at"]))
-    done      = sorted((p for p in _mine() if p["status"] not in OPEN), key=lambda p: -(p.get("posted_at") or p.get("due_at") or 0))
+                 "views", "url", "error", "creator", "progress", "tries", "visibility", "priority", "paused",
+                 "schedule_mode", "publish_at_utc", "publish_at_ist", "timezone", "uploaded_at",
+                 "yt_video_id", "remote_id", "clip", "job", "description", "hashtags", "cover", "duration"}
+    # Scheduled posts sorted by priority / due_at (ascending = queue order); done by posted_at / uploaded_at desc
+    scheduled = sorted((p for p in _mine() if p["status"] in OPEN), key=lambda p: p.get("priority", p.get("due_at") or 0))
+    done      = sorted((p for p in _mine() if p["status"] not in OPEN), key=lambda p: -(p.get("posted_at") or p.get("uploaded_at") or p.get("due_at") or 0))
     return [{k: v for k, v in p.items() if k in safe_keys} for p in scheduled + done]
 
 
@@ -58,13 +60,19 @@ def _mirror(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
-        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "url", "due_at", "error", "visibility", "paused", "priority")}
+        clip.setdefault("posts", {})[p["id"]] = {
+            k: p.get(k) for k in (
+                "account_name", "platform", "status", "url", "due_at", "error",
+                "visibility", "paused", "priority", "schedule_mode",
+                "publish_at_utc", "publish_at_ist", "remote_id", "yt_video_id"
+            )
+        }
         jobs.save(job)
 
 
 def _next_slot(account_id, gap_min, cap):
     """Earliest time that respects the gap between posts and the daily cap for this account."""
-    mine = [p for p in _mine() if p["account"] == account_id and p["status"] in OPEN + ("posted",)]
+    mine = [p for p in _mine() if p["account"] == account_id and p["status"] in OPEN + ("posted", "published")]
     t = max(time.time(), max((p.get("posted_at") or p["due_at"] for p in mine), default=0) + gap_min * 60)
     for _ in range(30):
         if sum(1 for p in mine if _day(p.get("posted_at") or p["due_at"]) == _day(t)) < cap:
@@ -74,7 +82,8 @@ def _next_slot(account_id, gap_min, cap):
     return t
 
 
-def enqueue(job, clip, account_ids, now=False, visibility="public") -> list:
+def enqueue(job, clip, account_ids, now=False, visibility="public",
+            schedule_mode="scheduling", publish_at_utc=None, publish_at_ist=None) -> list:
     c = creators.get(job["creator"]) or creators.DEFAULTS
     made = []
     with _lock:
@@ -83,14 +92,45 @@ def enqueue(job, clip, account_ids, now=False, visibility="public") -> list:
             if not acc:
                 continue
             if any(p["job"] == job["id"] and p["clip"] == clip["id"] and p["account"] == aid
-                   and p["status"] in OPEN + ("posted",) for p in _mine()):
+                   and p["status"] in OPEN + ("posted", "published") for p in _mine()):
                 continue  # never post the same clip to the same account twice
-            due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
-            p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
+
+            mode = schedule_mode
+            p_utc = publish_at_utc
+            p_ist = publish_at_ist
+
+            if acc["platform"] == "youtube":
+                if mode == "scheduling":
+                    if not p_utc:
+                        slot = scheduler.next_available_slot(aid, _mine())
+                        if slot:
+                            p_utc = slot["publish_at_utc"]
+                            p_ist = slot["publish_at_ist"]
+                    # Scheduled release requires initial privacyStatus 'private' on YouTube
+                    visibility = "private"
+                    # Upload immediately to YouTube as private; YouTube handles public release
+                    due = time.time()
+                elif mode == "private" or visibility == "private":
+                    mode = "private"
+                    visibility = "private"
+                    p_utc = None
+                    p_ist = None
+                    due = time.time()
+                else:
+                    due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
+            else:
+                due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
+
+            dur = round(clip.get("duration") or (clip.get("end", 0) - clip.get("start", 0)))
+            p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job.get("creator", ""),
                  "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
-                 "due_at": due, "priority": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
-                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "error": None, "views": None,
-                 "visibility": visibility, "paused": False}
+                 "schedule_mode": mode, "publish_at_utc": p_utc, "publish_at_ist": p_ist, "timezone": "Asia/Kolkata",
+                 "due_at": due, "priority": due, "created": time.time(), "uploaded_at": None, "posted_at": None,
+                 "title": clip.get("title") or clip.get("hook") or "Clip",
+                 "description": clip.get("description", ""), "hashtags": clip.get("hashtags", []),
+                 "cover": clip.get("cover", ""), "duration": dur,
+                 "score": clip.get("score", 0), "tries": 0, "url": "", "remote_id": "", "yt_video_id": "",
+                 "error": None, "views": None, "visibility": visibility, "paused": False}
             _posts.append(p)
             made.append(p)
         _save()
@@ -102,22 +142,43 @@ def enqueue(job, clip, account_ids, now=False, visibility="public") -> list:
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     c = creators.get(job["creator"])
-    # Auto-upload from job options (the new per-job toggle)
+
+    # Smart scheduling rule: Never automatically upload full-length videos!
+    # Only generated Shorts are eligible (duration <= 60 seconds)
+    clip_dur = clip.get("duration") or (clip.get("end", 0) - clip.get("start", 0))
+    if clip_dur and clip_dur > 60:
+        return
+    if job.get("is_full_video") or clip.get("is_short") is False:
+        return
+    if clip.get("status") != "done":
+        return
+
+    # Auto-upload from job options (the per-job toggle)
     if job.get("options", {}).get("auto_upload"):
-        # Get all connected accounts for this user
         try:
             with ctx.as_user(job["user"]):
                 accs = accounts.list_accounts()
-                account_ids = [a["id"] for a in accs if a.get("platform") in ("youtube", "instagram", "tiktok")]
+                yt_accs = [a for a in accs if a.get("platform") == "youtube"]
+                other_accs = [a for a in accs if a.get("platform") in ("instagram", "tiktok")]
         except Exception:  # noqa: BLE001
-            account_ids = []
-        if account_ids:
+            yt_accs, other_accs = [], []
+
+        mode = (job.get("options") or {}).get("upload_mode") or "scheduling"
+
+        # Auto-upload eligible Shorts to YouTube with fixed daily slots
+        for yacc in yt_accs:
+            slot = scheduler.next_available_slot(yacc["id"], _mine()) if mode == "scheduling" else None
+            enqueue(job, clip, [yacc["id"]], now=True,
+                    visibility="private",
+                    schedule_mode=mode,
+                    publish_at_utc=slot["publish_at_utc"] if slot else None,
+                    publish_at_ist=slot["publish_at_ist"] if slot else None)
+
+        for oacc in other_accs:
             vis = (job.get("options") or {}).get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
-            made = enqueue(job, clip, account_ids, now=False, visibility=vis)
-            if made:
-                creator_id = job.get("creator") or "none"
-                creators.log(creator_id, f"Auto-upload: queued for {len(made)} account(s): {clip.get('title') or clip.get('hook')}")
-            return  # don't double-post via creator autopost
+            enqueue(job, clip, [oacc["id"]], now=False, visibility=vis)
+        return
+
     # Legacy creator-level autopost setting
     if not c or not c["autopost"] or not c["accounts"]:
         return
@@ -147,18 +208,29 @@ def _post(p):
         path = Path(job["dir"]) / "clips" / clip["file"]
         creator = creators.get(job["creator"]) or dict(creators.DEFAULTS, name="clips")
         title, cap = clip.get("title") or clip.get("hook") or "Clip", _caption(clip, creator)
-        # Per-post visibility overrides creator default
         vis = p.get("visibility") or creator["privacy"]
+
         if acc["platform"] == "youtube":
-            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), vis)
+            p_utc = p.get("publish_at_utc") if p.get("schedule_mode") == "scheduling" else None
+            rid, url = accounts.youtube_upload(acc, path, title, cap + "\n\n#Shorts", clip.get("hashtags", []), vis, publish_at_utc=p_utc)
+            now_ts = time.time()
+            p.update(remote_id=rid, yt_video_id=rid, url=url, uploaded_at=now_ts, error=None)
+            if p.get("schedule_mode") == "scheduling" and p_utc:
+                p["status"] = "uploaded_scheduled"
+            elif p.get("schedule_mode") == "private" or vis == "private":
+                p["status"] = "uploaded_private"
+            else:
+                p["status"] = "posted"
+                p["posted_at"] = now_ts
         elif acc["platform"] == "instagram":
             rid, url = accounts.instagram_upload(acc, path, f"{title}\n\n{cap}", job["id"])
+            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
         elif acc["platform"] == "tiktok":
             rid, url = accounts.tiktok_upload(acc, path, f"{title}\n\n{cap}", vis)
+            p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
         else:
             raise RuntimeError("That kind of account is no longer supported.")
-        p.update(status="posted", posted_at=time.time(), remote_id=rid, url=url, error=None)
-        creators.log(p["creator"], f"Posted to {acc['name']}: {title}")
+        creators.log(p.get("creator", ""), f"Uploaded to {acc['name']}: {title}")
     except Exception as e:  # noqa: BLE001
         p["tries"] += 1
         p["error"] = str(e)[-300:]
@@ -166,7 +238,7 @@ def _post(p):
             p.update(status="scheduled", due_at=time.time() + 600)  # try again in 10 minutes
         else:
             p["status"] = "failed"
-            creators.log(p["creator"], f"Post failed on {p['account_name']}: {p['error']}")
+            creators.log(p.get("creator", ""), f"Post failed on {p['account_name']}: {p['error']}")
             alerts.notify(f"post failed on {p['account_name']} ({p['title']}): {p['error'][:200]}", kind="post")
     _save()
     _mirror(p)
@@ -226,12 +298,62 @@ def _stats():
 def cancel(pid):
     with _lock:
         p = next((p for p in _mine() if p["id"] == pid), None)
-        if not p or p["status"] not in ("scheduled", "posting"):
-            raise ValueError("Only posts that are still waiting can be cancelled.")
+        if not p or p["status"] not in ("scheduled", "posting", "uploaded_scheduled", "uploaded_private"):
+            raise ValueError("Only posts that are still waiting or scheduled can be cancelled.")
+        acc = accounts.get(p["account"])
+        if p.get("remote_id") and acc and acc.get("platform") == "youtube":
+            try:
+                accounts.youtube_update_status(acc, p["remote_id"], privacy="private", publish_at_utc=None)
+            except Exception:
+                pass
         p["status"] = "cancelled"
         p["paused"] = False
         _save()
     _mirror(p)
+
+
+def cancel_schedule(pid):
+    """Cancel scheduled release of an uploaded video on YouTube, keeping it private."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        acc = accounts.get(p["account"])
+        if p.get("remote_id") and acc and acc.get("platform") == "youtube":
+            try:
+                accounts.youtube_update_status(acc, p["remote_id"], privacy="private", publish_at_utc=None)
+            except Exception as e:
+                raise RuntimeError(f"Could not cancel schedule on YouTube: {e}")
+        p["schedule_mode"] = "private"
+        p["publish_at_utc"] = None
+        p["publish_at_ist"] = None
+        p["visibility"] = "private"
+        if p["status"] == "uploaded_scheduled":
+            p["status"] = "uploaded_private"
+        _save()
+    _mirror(p)
+    return p
+
+
+def publish_now(pid):
+    """Immediately make a scheduled or private video public."""
+    with _lock:
+        p = next((p for p in _mine() if p["id"] == pid), None)
+        if not p:
+            raise ValueError("Post not found.")
+        acc = accounts.get(p["account"])
+        if p.get("remote_id") and acc and acc.get("platform") == "youtube":
+            try:
+                accounts.youtube_update_status(acc, p["remote_id"], privacy="public", publish_at_utc=None)
+            except Exception as e:
+                raise RuntimeError(f"Could not publish video on YouTube: {e}")
+            p["status"] = "posted"
+            p["posted_at"] = time.time()
+            p["visibility"] = "public"
+            _save()
+            _mirror(p)
+            return p
+    return expedite(pid)
 
 
 def stop(pid):
@@ -307,21 +429,43 @@ def expedite_all():
 
 
 def update(pid, data: dict) -> dict:
-    """Update visibility (public/private/unlisted), custom schedule (due_at), or title."""
+    """Update visibility (public/private/unlisted), custom schedule (due_at/publish_at), title, or description."""
     with _lock:
         p = next((p for p in _mine() if p["id"] == pid), None)
         if not p:
             raise ValueError("Post not found.")
+        is_uploaded = p["status"] in ("uploaded_scheduled", "uploaded_private", "posted", "published") or bool(p.get("remote_id"))
+
+        # User requirement: "user should me able to change schedual date and time before uploading aftter uploaded then no change in time and date via peakcut). YouTube handles the scheduled public release."
+        if is_uploaded and ("due_at" in data or "publish_at_utc" in data or "publish_at_ist" in data):
+            raise ValueError("Cannot change publishing schedule after video is uploaded to YouTube. YouTube handles the scheduled public release.")
+
         if "visibility" in data and data["visibility"] in ("public", "private", "unlisted"):
             p["visibility"] = data["visibility"]
-        if "due_at" in data:
+        if "schedule_mode" in data and data["schedule_mode"] in ("scheduling", "private"):
+            p["schedule_mode"] = data["schedule_mode"]
+            if p["schedule_mode"] == "private":
+                p["publish_at_utc"] = None
+                p["publish_at_ist"] = None
+        if "publish_at_utc" in data and not is_uploaded:
+            p["publish_at_utc"] = str(data["publish_at_utc"])
+            p_dt = scheduler.parse_publish_time(data["publish_at_utc"])
+            if p_dt:
+                p["publish_at_ist"] = scheduler.to_ist_str(p_dt)
+        if "due_at" in data and not is_uploaded:
             p["due_at"] = float(data["due_at"])
+            p_dt = scheduler.parse_publish_time(p["due_at"])
+            if p_dt:
+                p["publish_at_utc"] = scheduler.to_utc_iso(p_dt)
+                p["publish_at_ist"] = scheduler.to_ist_str(p_dt)
             if "priority" not in data:
                 p["priority"] = p["due_at"]
         if "priority" in data:
             p["priority"] = float(data["priority"])
         if "title" in data and str(data["title"]).strip():
             p["title"] = str(data["title"]).strip()
+        if "description" in data:
+            p["description"] = str(data["description"]).strip()
         if "paused" in data:
             p["paused"] = bool(data["paused"])
         _save()

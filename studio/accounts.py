@@ -37,7 +37,7 @@ SETTING_DEFAULTS = {"discord_webhook": "", "telegram_token": "", "telegram_chat"
                     "digest_hour": 8, "last_digest": "", "tour_done": False,
                     "video_defaults": dict(VIDEO_DEFAULTS)}
 
-YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.force-ssl"
 IG = "https://graph.instagram.com"
 IG_UPLOAD = "https://rupload.facebook.com/ig-api-upload/v21.0"
 IG_SCOPES = "instagram_business_basic,instagram_business_content_publish"
@@ -388,11 +388,19 @@ def _yt_token(acc) -> str:
     return acc["access_token"]
 
 
-def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str):
+def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str, publish_at_utc: str = None):
     token = _yt_token(acc)
+    status = {"selfDeclaredMadeForKids": False}
+    if publish_at_utc:
+        # YouTube requires privacyStatus to be 'private' when publishAt is set
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at_utc
+    else:
+        status["privacyStatus"] = privacy if privacy in ("public", "private", "unlisted") else "private"
+
     meta = {"snippet": {"title": re.sub(r"[<>]", "", title)[:100] or "Clip", "description": re.sub(r"[<>]", "", description)[:4900],
                         "tags": tags[:15], "categoryId": "20"},
-            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}}
+            "status": status}
     size = path.stat().st_size
     start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
                               params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
@@ -403,6 +411,34 @@ def youtube_upload(acc, path: Path, title: str, description: str, tags: list, pr
                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}, timeout=900),
                       "Uploading to YouTube").json()
     return done["id"], f"https://www.youtube.com/shorts/{done['id']}"
+
+
+def youtube_update_status(acc, video_id: str, privacy: str = "private", publish_at_utc: str = None) -> dict:
+    """Update scheduled publishing or privacy status of an uploaded YouTube video."""
+    token = _yt_token(acc)
+    st = {"selfDeclaredMadeForKids": False}
+    if publish_at_utc:
+        st["privacyStatus"] = "private"
+        st["publishAt"] = publish_at_utc
+    else:
+        st["privacyStatus"] = privacy if privacy in ("public", "private", "unlisted") else "private"
+    body = {"id": video_id, "status": st}
+    res = _check(httpx.put("https://www.googleapis.com/youtube/v3/videos",
+                           params={"part": "status"}, json=body,
+                           headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                           timeout=30), "Updating YouTube video status").json()
+    return res
+
+
+def youtube_video_info(acc, video_id: str) -> dict:
+    """Fetch live status and snippet info from YouTube."""
+    token = _yt_token(acc)
+    r = _check(httpx.get("https://www.googleapis.com/youtube/v3/videos",
+                         params={"part": "status,snippet,statistics", "id": video_id},
+                         headers={"Authorization": f"Bearer {token}"}, timeout=30),
+               "Fetching YouTube video details").json()
+    items = r.get("items", [])
+    return items[0] if items else {}
 
 
 def youtube_views(acc, ids: list) -> dict:
