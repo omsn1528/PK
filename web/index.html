@@ -1859,6 +1859,7 @@ function drawSelBar() {
   put(bar, `<b>${n} selected</b>
     <button class="btn sm" data-act="selall">Select all</button>
     <button class="btn sm primary" data-act="seldl" ${dl ? "" : "disabled"}>${ic("down")}Download${dl ? ` ${dl} clip${dl === 1 ? "" : "s"}` : ""}</button>
+    <button class="btn sm" data-act="selpost" ${dl ? "" : "disabled"} style="background:rgba(255,107,38,.2);color:#FFB27A;border-color:rgba(255,107,38,.5)">${ic("send")}Post selected clips${dl ? ` (${dl})` : ""}</button>
     <button class="btn sm danger" data-act="seldel">${ic("trash")}Delete</button>
     <button class="btn sm" data-act="selclear">Cancel</button>`);
 }
@@ -2738,6 +2739,27 @@ document.addEventListener("click", async e => {
     }
     if (a === "dlall") return zipDownload((jobOf(d.j)?.clips || []).filter(c => c.status === "done").map(c => d.j + "." + c.id));
     if (a === "seldl") return zipDownload(selClips());
+    if (a === "selpost") {
+      const clips = selClips();
+      if (!clips.length) return toast("No finished clips selected to post.", "bad");
+      const hasAccounts = (S.accounts || []).length > 0;
+      if (!hasAccounts) return toast("No connected accounts found. Connect your YouTube account in Settings.", "bad");
+      const count = clips.length;
+      if (!await ask("Post selected clips?", `Queue ${count} selected clip${count === 1 ? "" : "s"} for upload using your default schedule/upload settings?`, "Post clips", false)) return;
+      toast(`Queueing ${count} clip${count === 1 ? "" : "s"} for upload…`, "ok");
+      try {
+        const r = await send("/api/bulk/post", {clips});
+        sel().clear(); await tick(); render();
+        if (r.queued) {
+          toast(`Queued ${r.clips} clip${r.clips === 1 ? "" : "s"} (${r.queued} post${r.queued === 1 ? "" : "s"}) with default upload settings!`, "ok");
+        } else {
+          toast(r.skipped ? `No new posts queued (${r.skipped} were already queued or skipped).` : "No posts were queued.", "bad");
+        }
+      } catch (e) {
+        toast(e.message || "Could not post selected clips", "bad");
+      }
+      return;
+    }
     if (a === "selclear") { sel().clear(); return render(); }
     if (a === "selall") {
       const cid = creatorId();

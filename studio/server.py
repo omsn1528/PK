@@ -1089,6 +1089,30 @@ def bulk_delete(body: dict = Body(...)):
     return account.delete_many(vids, _pairs(body.get("clips")))
 
 
+@app.post("/api/bulk/post")
+def bulk_post_route(body: dict = Body(...)):
+    _throttle("bulkpost:" + ctx.uid(), 30, 600)
+    raw = body.get("clips") if isinstance(body.get("clips"), list) else []
+    pairs = []
+    for x in raw[:300]:
+        if isinstance(x, (list, tuple)) and len(x) == 2 and all(isinstance(y, str) and re.fullmatch(r"[\w\-]{1,60}", y) for y in x):
+            pairs.append((str(x[0]), str(x[1])))
+        elif isinstance(x, str) and "." in x:
+            parts = x.split(".", 1)
+            if all(re.fullmatch(r"[\w\-]{1,60}", p) for p in parts):
+                pairs.append((parts[0], parts[1]))
+    if not pairs:
+        raise HTTPException(400, "No valid clips provided.")
+
+    accs = accounts.list_accounts()
+    if not accs:
+        raise HTTPException(400, "No connected accounts found. Connect your YouTube account in Settings first.")
+
+    res = posting.bulk_post(pairs, mode=body.get("mode"), target_accounts=body.get("accounts"))
+    ctx.bump()
+    return res
+
+
 @app.get("/api/clips.zip")
 def clips_zip(ids: str = ""):
     """Many clips as one download. `ids` is video.clip pairs separated by commas."""

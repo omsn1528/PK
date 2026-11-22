@@ -140,6 +140,89 @@ def enqueue(job, clip, account_ids, now=False, visibility="public",
     return made
 
 
+def post_clip_default(job, clip, mode=None, target_accounts=None) -> list:
+    """Post a single clip using previous default upload settings (YouTube scheduled slots / private)."""
+    # Smart scheduling rule: Never automatically upload full-length videos!
+    # Only generated Shorts are eligible (duration <= 60 seconds)
+    clip_dur = clip.get("duration") or (clip.get("end", 0) - clip.get("start", 0))
+    if clip_dur and clip_dur > 60:
+        return []
+    if job.get("is_full_video") or clip.get("is_short") is False:
+        return []
+    if clip.get("status") != "done":
+        return []
+
+    # User rule: never make or auto-upload generic clickbait clips ("WAIT FOR IT" or "Loud moment")
+    t_lower = (clip.get("title") or "").strip().lower()
+    h_lower = (clip.get("hook") or "").strip().lower()
+    if "loud moment" in t_lower or h_lower in ("wait for it", "wait for end", "wait till end", "wait till the end", "watch till end", "watch till the end"):
+        return []
+
+    c = creators.get(job.get("creator"))
+    opts = job.get("options") or {}
+    upload_mode = mode or opts.get("upload_mode") or "scheduling"
+
+    all_accs = accounts.list_accounts()
+    if target_accounts:
+        acc_objs = [a for a in all_accs if a.get("id") in target_accounts]
+    elif c and c.get("accounts"):
+        acc_objs = [a for a in all_accs if a.get("id") in c["accounts"]]
+    else:
+        acc_objs = all_accs
+
+    yt_accs = [a for a in acc_objs if a.get("platform") == "youtube"]
+    other_accs = [a for a in acc_objs if a.get("platform") in ("instagram", "tiktok")]
+
+    made_total = []
+    for yacc in yt_accs:
+        slot = scheduler.next_available_slot(yacc["id"], _mine()) if upload_mode == "scheduling" else None
+        m = enqueue(job, clip, [yacc["id"]], now=True,
+                    visibility="private",
+                    schedule_mode=upload_mode,
+                    publish_at_utc=slot["publish_at_utc"] if slot else None,
+                    publish_at_ist=slot["publish_at_ist"] if slot else None)
+        made_total.extend(m)
+
+    for oacc in other_accs:
+        vis = opts.get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
+        m = enqueue(job, clip, [oacc["id"]], now=False, visibility=vis)
+        made_total.extend(m)
+
+    if c and made_total:
+        creators.log(c["id"], f"Queued for {len(made_total)} account(s): {clip.get('title') or clip.get('hook')}")
+    return made_total
+
+
+def bulk_post(pairs, mode=None, target_accounts=None) -> dict:
+    """Post multiple selected clips (list of (job_id, clip_id)) using previous default upload settings."""
+    queued_posts = 0
+    clips_processed = 0
+    skipped = 0
+
+    accs = accounts.list_accounts()
+    if not accs:
+        return {"queued": 0, "clips": 0, "skipped": len(pairs), "error": "No connected accounts found"}
+
+    for jid, cid in pairs:
+        job = jobs.get(jid)
+        if not job:
+            skipped += 1
+            continue
+        clip = next((c for c in (job.get("clips") or []) if c.get("id") == cid), None)
+        if not clip or clip.get("status") != "done":
+            skipped += 1
+            continue
+
+        made = post_clip_default(job, clip, mode=mode, target_accounts=target_accounts)
+        if made:
+            queued_posts += len(made)
+            clips_processed += 1
+        else:
+            skipped += 1
+
+    return {"queued": queued_posts, "clips": clips_processed, "skipped": skipped}
+
+
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     # Smart scheduling rule: Never automatically upload full-length videos!
@@ -168,23 +251,7 @@ def on_clip_ready(job, clip):
         # Auto-upload from job options (the per-job toggle)
         if job.get("options", {}).get("auto_upload"):
             try:
-                accs = accounts.list_accounts()
-                yt_accs = [a for a in accs if a.get("platform") == "youtube"]
-                other_accs = [a for a in accs if a.get("platform") in ("instagram", "tiktok")]
-                mode = (job.get("options") or {}).get("upload_mode") or "scheduling"
-
-                # Auto-upload eligible Shorts to YouTube with fixed daily slots
-                for yacc in yt_accs:
-                    slot = scheduler.next_available_slot(yacc["id"], _mine()) if mode == "scheduling" else None
-                    enqueue(job, clip, [yacc["id"]], now=True,
-                            visibility="private",
-                            schedule_mode=mode,
-                            publish_at_utc=slot["publish_at_utc"] if slot else None,
-                            publish_at_ist=slot["publish_at_ist"] if slot else None)
-
-                for oacc in other_accs:
-                    vis = (job.get("options") or {}).get("upload_visibility") or (c.get("privacy") if c else "public") or "public"
-                    enqueue(job, clip, [oacc["id"]], now=False, visibility=vis)
+                post_clip_default(job, clip)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
             return
